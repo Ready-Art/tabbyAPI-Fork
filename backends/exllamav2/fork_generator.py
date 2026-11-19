@@ -294,11 +294,8 @@ class ExLlamaV2ForkGeneratorAsync:
             self._current_job = None
 
     def _mp_mtp_eligible(self, job) -> bool:
-        if not _is_greedy(job.gen_settings):
-            xlogger.warning(
-                "MP MTP drafting is greedy-only; using plain MP decoding for this request"
-            )
-            return False
+        # BUG 104: MP MTP now supports sampling (exact-resync from the target's verified
+        # logits, mirroring SP), so non-greedy requests no longer fall back to plain MP.
         if job.filters or job.banned_strings:
             xlogger.warning(
                 "Filters/banned strings are not supported by MP MTP; "
@@ -445,6 +442,7 @@ class ExLlamaV2ForkGeneratorAsync:
         driver.begin(job.input_ids, logits, state)
 
         gen_ids: List[int] = []
+        seq_ids = job.input_ids.clone()
         emitted = ""
         new_tokens = 0
         time_gen_start = time.perf_counter()
@@ -465,8 +463,10 @@ class ExLlamaV2ForkGeneratorAsync:
             if job.abort_event.is_set():
                 break
 
-            tok = int(driver.step())
+            ban = list(stop_tokens) if new_tokens < job.min_new_tokens else None
+            tok = int(driver.step(settings, self.tokenizer, seq_ids, ban_tokens=ban))
             new_tokens += 1
+            seq_ids = torch.cat([seq_ids, torch.tensor([[tok]], dtype=torch.long)], dim=-1)
 
             if tok in stop_tokens:
                 if new_tokens > job.min_new_tokens:
