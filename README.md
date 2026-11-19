@@ -36,7 +36,7 @@
 
 > [!NOTE]
 >
-> This branch (`exl2-checkpoint`) adds support for the [ReadyArt ExLlamaV2 fork](https://github.com/Ready-Art/Exllamav2): single-process (`sp`) and multiprocess (`mp`) tensor parallelism, MTP speculative decoding on both, TP CUDA graphs, FlashInfer attention (required by the fork), and Gemma-4 thinking/tool-call handling incl. `reasoning_effort`. [Setup and configuration docs.](docs/11.-ReadyArt-ExLlamaV2-Fork.md)
+> This fork (branch `ReadyArt`) adds support for the [ReadyArt ExLlamaV2 fork](https://github.com/Ready-Art/exllamav2-Fork): single-process (`sp`) and multiprocess (`mp`) tensor parallelism, MTP speculative decoding on both, TP CUDA graphs, FlashInfer attention (required by the fork) plus Flash-Attention 2 (also required for now), and Gemma-4 thinking/tool-call handling incl. `reasoning_effort`. [Setup and configuration docs.](docs/11.-ReadyArt-ExLlamaV2-Fork.md)
 
 > [!NOTE]
 > 
@@ -46,7 +46,7 @@ A FastAPI based application that allows for generating text using an LLM (large 
 
 TabbyAPI is also the official API backend server for ExllamaV2 and V3.
 
-**Multi-GPU / MTP:** install this branch with the [ReadyArt ExLlamaV2 fork](https://github.com/Ready-Art/Exllamav2) for tensor parallelism (SP/MP), MTP speculative decoding, CUDA graphs and Gemma-4 thinking/tool calls — see [Installing with the ReadyArt ExLlamaV2 fork](#installing-with-the-readyart-exllamav2-fork-multi-gpu--mtp) below.
+**Multi-GPU / MTP:** install this fork with the [ReadyArt ExLlamaV2 fork](https://github.com/Ready-Art/exllamav2-Fork) for tensor parallelism (SP/MP), MTP speculative decoding, CUDA graphs and Gemma-4 thinking/tool calls — see [Installing with the ReadyArt ExLlamaV2 fork](#installing-with-the-readyart-exllamav2-fork-multi-gpu--mtp) below.
 
 ## Disclaimer
 
@@ -81,38 +81,51 @@ For Docker Compose, custom config mounts, or building the image locally, see the
 
 ## Installing with the ReadyArt ExLlamaV2 fork (multi-GPU / MTP)
 
-This branch (`exl2-checkpoint`, public repo: [Ready-Art/TabbyAPI](https://github.com/Ready-Art/TabbyAPI))
-supports the [ReadyArt ExLlamaV2 fork](https://github.com/Ready-Art/Exllamav2): single-process (`sp`)
+This fork ([Ready-Art/tabbyAPI-Fork](https://github.com/Ready-Art/tabbyAPI-Fork), branch `ReadyArt`)
+supports the [ReadyArt ExLlamaV2 fork](https://github.com/Ready-Art/exllamav2-Fork): single-process (`sp`)
 and multiprocess (`mp`) tensor parallelism, MTP speculative decoding on both, TP CUDA graphs, and
 Gemma-4 thinking / tool calls. The fork is built and tested on **SM86 (Ampere — RTX 3090)**; other
 architectures are untested.
 
-**Requirements:** a CUDA build of PyTorch, a CUDA toolkit matching it, and **FlashInfer >= 0.7.4**
-(a hard requirement of the fork). Source installs of the fork are detected automatically and work
-with CUDA 13 Torch (prebuilt upstream exllamav2 wheels are CUDA 12 only).
+**Requirements:** Python 3.12, a CUDA build of PyTorch with a CUDA toolkit (`nvcc` on `PATH`),
+**FlashInfer >= 0.7.4** (a hard requirement of the fork), and **Flash-Attention 2 — required for now
+even with FlashInfer** (the fork's TP / dynamic-generator paths still call flash-attn kernels).
+Tested combination: Python 3.12.15, torch 2.15.0+cu132, CUDA toolkit 13.5, FlashInfer 0.7.4,
+flash-attn 2.8.3. Source installs of the fork are detected automatically and work with CUDA 13 Torch
+(prebuilt upstream exllamav2 wheels are CUDA 12 only).
 
 ```bash
-# 1. TabbyAPI (this branch)
-git clone https://github.com/Ready-Art/TabbyAPI -b exl2-checkpoint
-cd TabbyAPI
+# 0. Python 3.12 environment + CUDA 13.2 torch (tested combination).
+#    Install torch BEFORE building the fork: its setup.py compiles against the installed torch.
+python3.12 -m venv venv && source venv/bin/activate
+pip install torch==2.15.0+cu132 --index-url https://download.pytorch.org/whl/cu132
+
+# 1. TabbyAPI (this fork)
+git clone https://github.com/Ready-Art/tabbyAPI-Fork
+cd tabbyAPI-Fork
 pip install -e .
 
 # 2. The ReadyArt exllamav2 fork, built from source for your GPU.
 #    TORCH_CUDA_ARCH_LIST: "8.6" for RTX 3090, "8.9" for RTX 4090, etc.
-git clone https://github.com/Ready-Art/Exllamav2
-cd Exllamav2
-TORCH_CUDA_ARCH_LIST="8.6" pip install -e .
+git clone https://github.com/Ready-Art/exllamav2-Fork
+cd exllamav2-Fork
+pip install -r requirements.txt
+TORCH_CUDA_ARCH_LIST="8.6" pip install -e . --no-build-isolation
 cd ..
 
-# 3. FlashInfer (kernel wheels are CUDA/torch-version specific;
+# 3. FlashInfer kernels (hard requirement; kernel wheels are CUDA/torch-version specific —
 #    re-run download-kernels after every FlashInfer upgrade)
-pip install "flashinfer-python>=0.7.4"
 flashinfer download-kernels
 
-# 4. Model + MTP drafter
-huggingface-cli download ReadyArt/Gemma-4-31B-IT-EXL2-6.0BPW-HB16 \
+# 4. Flash-Attention 2 — required for now even with FlashInfer.
+#    Wheel must match Python/torch/CUDA; this one is for Python 3.12 / torch 2.15 / CUDA 13.2.
+#    Other combinations: https://github.com/mjun0812/flash-attention-prebuild-wheels/releases
+pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v1.5.0/flash_attn-2.8.3+cu132torch2.15-cp312-cp312-linux_x86_64.whl"
+
+# 5. Model + MTP drafter
+hf download ReadyArt/Gemma-4-31B-IT-EXL2-6.0BPW-HB16 \
     --local-dir models/Gemma-4-31B-IT-EXL2-6.0BPW-HB16
-huggingface-cli download google/gemma-4-31B-it-assistant \
+hf download google/gemma-4-31B-it-assistant \
     --local-dir models/gemma-4-31B-it-assistant
 ```
 
