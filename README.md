@@ -66,19 +66,6 @@ For a step-by-step guide, choose the format that works best for you:
 
 🎥 Watch the [Video Guide](https://www.youtube.com/watch?v=03jYz0ijbUU) – A hands-on walkthrough to get you up and running quickly.
 
-### Docker
-
-TabbyAPI publishes a CUDA image to GitHub Container Registry. Install Docker and the NVIDIA container toolkit, then start the published image with your models directory mounted into the container:
-
-```bash
-docker pull ghcr.io/theroyallab/tabbyapi:latest
-docker run --gpus all --name tabbyapi -p 5000:5000 -v /path/to/models:/app/models ghcr.io/theroyallab/tabbyapi:latest
-```
-
-Replace `/path/to/models` with the folder that contains your local model directories. The API is exposed on `http://localhost:5000`.
-
-For Docker Compose, custom config mounts, or building the image locally, see the [Docker instructions](docs/01.-Getting-Started.md#docker).
-
 ## Installing with the ReadyArt ExLlamaV2 fork (multi-GPU / MTP)
 
 This fork ([Ready-Art/tabbyAPI-Fork](https://github.com/Ready-Art/tabbyAPI-Fork), branch `ReadyArt`)
@@ -94,23 +81,29 @@ Tested combination: Python 3.12.15, torch 2.15.0+cu132, CUDA toolkit 13.5, Flash
 flash-attn 2.8.3. Source installs of the fork are detected automatically and work with CUDA 13 Torch
 (prebuilt upstream exllamav2 wheels are CUDA 12 only).
 
+Use [uv](https://docs.astral.sh/uv/getting-started/installation/) to manage Python — it installs
+Python 3.12 itself, so no system Python 3.12 package is needed:
+
 ```bash
-# 0. Python 3.12 environment + CUDA 13.2 torch (tested combination).
+# 0. uv + Python 3.12 environment + CUDA 13.2 torch (tested combination).
 #    Install torch BEFORE building the fork: its setup.py compiles against the installed torch.
-python3.12 -m venv venv && source venv/bin/activate
-pip install torch==2.15.0+cu132 --index-url https://download.pytorch.org/whl/cu132
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv python install 3.12
+uv venv venv --python 3.12
+source venv/bin/activate
+uv pip install torch==2.15.0+cu132 --index-url https://download.pytorch.org/whl/cu132
 
 # 1. TabbyAPI (this fork)
 git clone https://github.com/Ready-Art/tabbyAPI-Fork
 cd tabbyAPI-Fork
-pip install -e .
+uv pip install -e .
 
 # 2. The ReadyArt exllamav2 fork, built from source for your GPU.
 #    TORCH_CUDA_ARCH_LIST: "8.6" for RTX 3090, "8.9" for RTX 4090, etc.
 git clone https://github.com/Ready-Art/exllamav2-Fork
 cd exllamav2-Fork
-pip install -r requirements.txt
-TORCH_CUDA_ARCH_LIST="8.6" pip install -e . --no-build-isolation
+uv pip install -r requirements.txt
+TORCH_CUDA_ARCH_LIST="8.6" uv pip install -e . --no-build-isolation
 cd ..
 
 # 3. FlashInfer kernels (hard requirement; kernel wheels are CUDA/torch-version specific —
@@ -120,7 +113,7 @@ flashinfer download-kernels
 # 4. Flash-Attention 2 — required for now even with FlashInfer.
 #    Wheel must match Python/torch/CUDA; this one is for Python 3.12 / torch 2.15 / CUDA 13.2.
 #    Other combinations: https://github.com/mjun0812/flash-attention-prebuild-wheels/releases
-pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v1.5.0/flash_attn-2.8.3+cu132torch2.15-cp312-cp312-linux_x86_64.whl"
+uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v1.5.0/flash_attn-2.8.3+cu132torch2.15-cp312-cp312-linux_x86_64.whl"
 
 # 5. Model + MTP drafter
 hf download ReadyArt/Gemma-4-31B-IT-EXL2-6.0BPW-HB16 \
