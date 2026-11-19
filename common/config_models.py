@@ -214,7 +214,27 @@ class ModelConfig(BaseConfigModel):
             "Sets a backend type for tensor parallelism. (default: native).\n"
             "Options: native, nccl\n"
             "Native is recommended for PCIe GPUs\n"
-            "NCCL is recommended for NVLink."
+            "NCCL is recommended for NVLink.\n"
+            "ExllamaV2 (ReadyArt fork) additionally supports: sp, mp\n"
+            "sp: single-process TP with the streaming generator (required for\n"
+            "sliding-window models like Gemma-4) and optional MTP drafting.\n"
+            "mp (alias: nccl): one worker process per GPU, optional MTP drafting."
+        ),
+    )
+    tp_graphs: Optional[bool] = Field(
+        True,
+        description=(
+            "Capture TP decode steps into CUDA graphs (default: True).\n"
+            "ExllamaV2 ReadyArt fork only (sp/mp backends).\n"
+            "Sets EXL2_TP_GRAPHS. Disable to fall back to eager TP decode."
+        ),
+    )
+    flashinfer_plan_cache: Optional[bool] = Field(
+        False,
+        description=(
+            "Cache FlashInfer attention plans keyed on shape (default: False).\n"
+            "ExllamaV2 ReadyArt fork only. Sets EXLLAMA_FLASHINFER_PLAN_CACHE.\n"
+            "Experimental: re-planning on every call is the correctness-first default."
         ),
     )
     gpu_split_auto: Optional[bool] = Field(
@@ -354,7 +374,11 @@ class DraftModelConfig(BaseConfigModel):
         description=(
             "Drafting mode (default: model).\n"
             "Options: model, disabled, mtp, ngram.\n"
-            "In `model` mode, drafting is disabled if no draft_model_name is provided."
+            "In `model` mode, drafting is disabled if no draft_model_name is provided.\n"
+            "ExllamaV2 (ReadyArt fork): `mtp` loads a Gemma-4 assistant drafter\n"
+            "(e.g. google/gemma-4-31B-it-assistant) that cross-attends to the target's\n"
+            "K/V. Works with the sp and mp tensor-parallel backends. `ngram` is not\n"
+            "supported by the exllamav2 fork paths."
         ),
     )
     # TODO: convert this to a pathlib.path?
@@ -413,6 +437,24 @@ class DraftModelConfig(BaseConfigModel):
         description=(
             "Minimum match length for exllamav3 n-gram drafting (default: 2).\n"
             "Only used when draft_mode is ngram."
+        ),
+    )
+    draft_device: Optional[int] = Field(
+        0,
+        description=(
+            "Device for the MTP drafter (default: 0).\n"
+            "ExllamaV2 ReadyArt fork only. The drafter is a single-device model even\n"
+            "when the target runs tensor-parallel."
+        ),
+        ge=0,
+    )
+    mtp_draft_graph: Optional[bool] = Field(
+        False,
+        description=(
+            "Capture the MTP drafter step into a CUDA graph (default: False).\n"
+            "ExllamaV2 ReadyArt fork only. Sets EXL2_MTP_DRAFT_GRAPH.\n"
+            "Experimental: eager FlashInfer drafting is the verified default; the\n"
+            "graphed path is bandwidth-bound at long context."
         ),
     )
 

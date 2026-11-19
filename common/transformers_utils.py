@@ -47,6 +47,8 @@ class HuggingFaceConfig(BaseModel):
     Will be expanded as needed.
     """
 
+    architectures: Optional[List[str]] = None
+    model_type: Optional[str] = None
     max_position_embeddings: int = None
     text_config: Optional[TextConfig] = None
     eos_token_id: Optional[Union[int, List[int]]] = None

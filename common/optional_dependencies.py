@@ -1,7 +1,8 @@
 """Construct a model of all optional dependencies"""
 
 import importlib.util
-from importlib.metadata import PackageNotFoundError
+import json
+from importlib.metadata import PackageNotFoundError, distribution
 from importlib.metadata import version as package_version
 from common.logger import xlogger
 from packaging import version
@@ -52,6 +53,25 @@ def is_torch_cuda_13() -> bool:
     return local_version.startswith("cu13")
 
 
+def is_local_install(package_name: str) -> bool:
+    """
+    Check whether a package was installed from a local directory (editable or not).
+
+    Source builds are compiled against the installed Torch, so they are not bound
+    to the CUDA version of the prebuilt release wheels (e.g. the ReadyArt exllamav2
+    fork built from source for CUDA 13 Torch).
+    """
+
+    try:
+        direct_url = distribution(package_name).read_text("direct_url.json")
+        if direct_url:
+            return bool(json.loads(direct_url).get("dir_info"))
+    except Exception:
+        pass
+
+    return False
+
+
 def get_installed_deps() -> DependenciesModel:
     """Check if optional dependencies are installed by looping over the fields."""
 
@@ -62,7 +82,13 @@ def get_installed_deps() -> DependenciesModel:
     for field_name in fields.keys():
         installed_deps[field_name] = is_installed(field_name)
 
-    if installed_deps.get("exllamav2") and is_torch_cuda_13():
+    # Prebuilt exllamav2 wheels target CUDA 12 and are incompatible with CUDA 13
+    # Torch. Local/source installs are built against the installed Torch instead.
+    if (
+        installed_deps.get("exllamav2")
+        and is_torch_cuda_13()
+        and not is_local_install("exllamav2")
+    ):
         installed_deps["exllamav2"] = False
 
     return DependenciesModel(**installed_deps)

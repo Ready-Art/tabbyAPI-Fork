@@ -3,6 +3,7 @@
 import asyncio
 import gc
 import math
+import os
 import pathlib
 import torch
 from exllamav2 import (
@@ -27,6 +28,10 @@ from itertools import zip_longest
 from typing import Dict, List, Optional
 
 from backends.base_model_container import BaseModelContainer
+from backends.exllamav2.fork_generator import (
+    ExLlamaV2ForkGeneratorAsync,
+    ExLlamaV2ForkJobAsync,
+)
 from backends.exllamav2.grammar import (
     ExLlamaV2Grammar,
     clear_grammar_func_cache,
@@ -53,6 +58,20 @@ from common.transformers_utils import HFModel
 from common.utils import calculate_rope_alpha, coalesce, unwrap
 from endpoints.core.types.model import ModelCard, ModelCardParameters
 from endpoints.OAI.utils.tools import is_supported_format
+
+# ReadyArt exllamav2 fork extensions (SWA cache, TP process group, MTP drafter).
+# Guarded so the container keeps working with upstream exllamav2 installs.
+try:
+    from exllamav2.cache import ExLlamaV2Cache_SWA
+except ImportError:
+    ExLlamaV2Cache_SWA = None
+
+try:
+    from exllamav2.mtp_drafter import Gemma4AssistantDrafter
+    from exllamav2.tp_mp import TPProcessGroup
+except ImportError:
+    Gemma4AssistantDrafter = None
+    TPProcessGroup = None
 
 
 class ExllamaV2Container(BaseModelContainer):
@@ -93,6 +112,18 @@ class ExllamaV2Container(BaseModelContainer):
     gpu_split_auto: bool = True
     autosplit_reserve: List[float] = [96 * 1024**2]
     use_tp: bool = False
+
+    # ReadyArt fork vars (TP backends, MTP drafting, FlashInfer, CUDA graphs)
+    tp_backend: str = "native"
+    use_mtp: bool = False
+    mtp_drafter: Optional[object] = None
+    mtp_window: int = 6
+    draft_device: int = 0
+    tp_group: Optional[object] = None
+    fork_mode: bool = False
+    is_swa: bool = False
+    is_gemma4: bool = False
+    use_flashinfer: bool = True
 
     # Vision vars
     use_vision: bool = False
@@ -146,6 +177,25 @@ class ExllamaV2Container(BaseModelContainer):
         # Check if the model arch is compatible with various exl2 features
         self.config.arch_compat_overrides()
 
+        # Sliding-window attention (e.g. Gemma-4) needs the fork's SWA ring cache
+        self.is_swa = getattr(self.config, "sliding_window", 0) > 0
+        if self.is_swa and ExLlamaV2Cache_SWA is None:
+            xlogger.warning(
+                "This model uses sliding-window attention, which requires the "
+                "ReadyArt exllamav2 fork (ExLlamaV2Cache_SWA). Long-context output "
+                "may be incorrect with upstream exllamav2."
+            )
+
+        # FlashInfer is a hard requirement of the ReadyArt fork (>= 0.7.4) and is
+        # always on; there is no disable switch. Reported on the model card only.
+        self.use_flashinfer = True
+
+        # Fork runtime knobs, read by the model/drafter/workers at load time
+        os.environ["EXL2_TP_GRAPHS"] = "1" if unwrap(kwargs.get("tp_graphs"), True) else "0"
+        os.environ["EXLLAMA_FLASHINFER_PLAN_CACHE"] = (
+            "1" if unwrap(kwargs.get("flashinfer_plan_cache"), False) else "0"
+        )
+
         # Set vision state and error if vision isn't supported on the current model
         self.use_vision = unwrap(kwargs.get("vision"), False)
         if self.use_vision and not self.config.vision_model_type:
@@ -158,10 +208,48 @@ class ExllamaV2Container(BaseModelContainer):
         # Prepare the draft model config if necessary
         draft_args = unwrap(kwargs.get("draft_model"), {})
         draft_model_name = draft_args.get("draft_model_name")
-        self.use_draft_model = draft_args and draft_model_name
+        draft_mode = unwrap(draft_args.get("draft_mode"), "model")
+
+        # MTP drafting (ReadyArt fork): a Gemma-4 assistant drafter that
+        # cross-attends to the target's K/V instead of a standalone draft model
+        self.use_mtp = draft_mode == "mtp"
+        if self.use_mtp:
+            if not draft_model_name:
+                raise ValueError(
+                    "draft_mode 'mtp' requires draft_model_name "
+                    "(e.g. google/gemma-4-31B-it-assistant downloaded into the draft model dir)"
+                )
+            if Gemma4AssistantDrafter is None:
+                xlogger.warning(
+                    "MTP drafting requires the ReadyArt exllamav2 fork "
+                    "(exllamav2.mtp_drafter). Disabling MTP."
+                )
+                self.use_mtp = False
+            else:
+                self.draft_model_dir = (
+                    pathlib.Path(unwrap(draft_args.get("draft_model_dir"), "models"))
+                    / draft_model_name
+                )
+                self.mtp_window = unwrap(draft_args.get("draft_num_tokens"), 6)
+                self.draft_device = unwrap(draft_args.get("draft_device"), 0)
+                os.environ["EXL2_MTP_DRAFT_GRAPH"] = (
+                    "1" if unwrap(draft_args.get("mtp_draft_graph"), False) else "0"
+                )
+                xlogger.info(
+                    f"MTP drafting enabled: {self.draft_model_dir} "
+                    f"(window {self.mtp_window}, device cuda:{self.draft_device})"
+                )
+
+        if draft_mode == "ngram":
+            xlogger.warning(
+                "Config-level ngram drafting is not supported by exllamav2. "
+                "Use the speculative_ngram sampler option instead."
+            )
+
+        self.use_draft_model = bool(draft_args) and bool(draft_model_name) and draft_mode == "model"
 
         # Always disable draft if params are incorrectly configured
-        if draft_args and draft_model_name is None:
+        if draft_mode == "model" and draft_args and draft_model_name is None:
             xlogger.warning(
                 "Draft model is disabled because a model name "
                 "wasn't provided. Please check your config.yml!"
@@ -189,6 +277,14 @@ class ExllamaV2Container(BaseModelContainer):
                 f"Provided cache mode '{self.cache_mode}' is not a "
                 "valid choice for exllamav2, please check your settings. "
                 "Defaulting to FP16."
+            )
+            self.cache_mode = "FP16"
+
+        # The SWA ring cache is FP16-only
+        if self.is_swa and self.cache_mode != "FP16":
+            xlogger.warning(
+                "Quantized K/V cache modes are not supported with sliding-window "
+                "attention. Defaulting to FP16."
             )
             self.cache_mode = "FP16"
 
@@ -239,11 +335,81 @@ class ExllamaV2Container(BaseModelContainer):
                     if memory > 0
                 ]
 
-        # Hardcode max output length to 16
-        self.config.max_output_len = 16
+        # Tensor-parallel backend (ReadyArt fork: sp = single-process streaming TP,
+        # mp = one worker process per GPU; nccl is an alias for mp)
+        self.tp_backend = unwrap(kwargs.get("tensor_parallel_backend"), "native")
+        if self.tp_backend == "nccl":
+            self.tp_backend = "mp"
+        if self.tp_backend in ("sp", "mp"):
+            if self.tp_backend == "mp" and TPProcessGroup is None:
+                xlogger.warning(
+                    "The 'mp' tensor-parallel backend requires the ReadyArt exllamav2 "
+                    "fork (exllamav2.tp_mp). Falling back to native TP."
+                )
+                self.tp_backend = "native"
+            else:
+                self.use_tp = True
+                self.gpu_split_auto = False
+                xlogger.info(f"Using fork tensor-parallel backend: {self.tp_backend}")
+        elif self.tp_backend != "native":
+            xlogger.warning(
+                f"Unknown tensor_parallel_backend '{self.tp_backend}' for exllamav2. "
+                "Options: native, sp, mp. Defaulting to native."
+            )
+            self.tp_backend = "native"
+
+        # The paged TP attention kernel has no sliding-window support; SWA models
+        # must use the fork's streaming (sp) or multiprocess (mp) path
+        if self.is_swa and self.use_tp and self.tp_backend == "native":
+            if ExLlamaV2Cache_SWA is not None:
+                xlogger.warning(
+                    "Sliding-window model with tensor parallelism: switching to the "
+                    "fork 'sp' backend (the paged TP kernel does not support SWA)."
+                )
+                self.tp_backend = "sp"
+            else:
+                xlogger.warning(
+                    "Sliding-window model with tensor parallelism requires the "
+                    "ReadyArt exllamav2 fork. Falling back to autosplit."
+                )
+                self.use_tp = False
+                self.gpu_split_auto = True
+
+        # MTP drafting rides on the streaming generator, not the dynamic one
+        if self.use_mtp and self.use_tp and self.tp_backend == "native":
+            xlogger.info("MTP drafting with TP: switching to the fork 'sp' backend.")
+            self.tp_backend = "sp"
+
+        self.fork_mode = self.use_mtp or self.tp_backend in ("sp", "mp")
+
+        # SWA models on the non-TP path also use the streaming wrapper: the paged
+        # dynamic generator's SWA ring protocol (prefill window_beg/ring shifts,
+        # page reuse over rings) is not verified here, while the streaming path's
+        # ring handling is. One job at a time, fresh prefill per job.
+        if self.is_swa and not self.use_tp and ExLlamaV2Cache_SWA is not None:
+            if not self.fork_mode:
+                xlogger.info(
+                    "Sliding-window model: using the streaming generation path "
+                    "(batch size 1) for verified SWA ring handling."
+                )
+            self.fork_mode = True
+
+        if self.fork_mode and self.use_vision:
+            xlogger.warning(
+                "Vision input is not supported by the fork TP/MTP paths. Disabling vision."
+            )
+            self.use_vision = False
+
+        # Hardcode max output length to 16 (MTP verify windows may need more)
+        self.config.max_output_len = max(16, self.mtp_window + 1 if self.use_mtp else 16)
 
         # Set max batch size to the config override
         self.max_batch_size = unwrap(kwargs.get("max_batch_size"))
+        if self.fork_mode:
+            # The fork TP/MTP paths own a single cache: one job at a time
+            if self.max_batch_size is None or self.max_batch_size > 1:
+                xlogger.info("Fork TP/MTP mode: limiting max_batch_size to 1.")
+            self.max_batch_size = 1
 
         # Check whether the user's configuration supports flash/paged attention
         # Also check if exl2 has disabled flash attention
@@ -293,7 +459,7 @@ class ExllamaV2Container(BaseModelContainer):
         rope_alpha = unwrap(kwargs.get("rope_alpha"), "auto")
         if rope_alpha == "auto":
             self.config.scale_alpha_value = calculate_rope_alpha(
-                hf_model.hf_config.max_position_embeddings, self.config.max_seq_len
+                hf_model.hf_config.get_max_position_embeddings(), self.config.max_seq_len
             )
         else:
             self.config.scale_alpha_value = rope_alpha
@@ -351,7 +517,7 @@ class ExllamaV2Container(BaseModelContainer):
             draft_rope_alpha = unwrap(draft_args.get("draft_rope_alpha"), "auto")
             if draft_rope_alpha == "auto":
                 self.draft_config.scale_alpha_value = calculate_rope_alpha(
-                    hf_model.hf_config.max_position_embeddings,
+                    hf_model.hf_config.get_max_position_embeddings(),
                     self.draft_config.max_seq_len,
                 )
             else:
@@ -380,6 +546,36 @@ class ExllamaV2Container(BaseModelContainer):
         self.reasoning_end_token = kwargs.get("reasoning_end_token", "</think>")
         self.reasoning_suppress_header = kwargs.get("reasoning_suppress_header", None)
         self.force_enable_thinking = kwargs.get("force_enable_thinking", False)
+
+        # Gemma-4 conveniences: its reasoning channel is <|channel>thought\n ...
+        # <channel|> (enabled via <|think|> in the system turn, which the model's
+        # chat template injects for enable_thinking), and its native tool-call
+        # syntax is handled by the 'gemma4' tool format.
+        _hf_cfg = hf_model.hf_config
+        self.is_gemma4 = (_hf_cfg.model_type or "").startswith("gemma4") or any(
+            "gemma4" in arch.lower() for arch in (_hf_cfg.architectures or [])
+        )
+        if self.is_gemma4:
+            if (
+                self.reasoning
+                and self.reasoning_start_token == "<think>"
+                and self.reasoning_end_token == "</think>"
+            ):
+                # The thought channel opens with <|channel>thought\n, but that
+                # spans multiple tokens; the stream collector matches tags per
+                # chunk. Use the single-token opener and strip the "thought\n"
+                # header from the reasoning block instead.
+                self.reasoning_start_token = "<|channel>"
+                self.reasoning_end_token = "<channel|>"
+                if self.reasoning_suppress_header is None:
+                    self.reasoning_suppress_header = "thought\n"
+                xlogger.info(
+                    "Gemma-4 detected: using thought-channel reasoning tags "
+                    "(<|channel> / <channel|>, suppress header 'thought\\n')."
+                )
+            if not self.tool_format:
+                self.tool_format = "gemma4"
+                xlogger.info("Gemma-4 detected: defaulting tool_format to 'gemma4'.")
 
         # Return the created instance
         return self
@@ -451,6 +647,11 @@ class ExllamaV2Container(BaseModelContainer):
                 id=self.draft_model_dir.name,
                 parameters=draft_model_params,
             )
+        elif self.use_mtp:
+            draft_model_card = ModelCard(
+                id=self.draft_model_dir.name,
+                parameters=ModelCardParameters(draft_mode="mtp"),
+            )
 
         model_params = ModelCardParameters(
             max_seq_len=self.config.max_seq_len,
@@ -462,6 +663,10 @@ class ExllamaV2Container(BaseModelContainer):
             chunk_size=self.config.max_input_len,
             use_vision=self.use_vision,
             draft=draft_model_card,
+            tensor_parallel=self.use_tp,
+            tensor_parallel_backend=self.tp_backend if self.use_tp else None,
+            use_mtp=self.use_mtp,
+            flashinfer=self.use_flashinfer,
         )
 
         if self.prompt_template:
@@ -624,61 +829,120 @@ class ExllamaV2Container(BaseModelContainer):
                 if value:
                     yield value
 
-        self.model = ExLlamaV2(self.config)
-        xlogger.info("Loading model: " + self.config.model_dir)
-
-        # Get class of the model cache
+        # Get class of the model cache (SWA models need the fork's ring cache)
         cache_class = self.get_cache_class(self.cache_mode)
+        if self.is_swa and ExLlamaV2Cache_SWA is not None:
+            cache_class = ExLlamaV2Cache_SWA
 
-        # Load model with manual split
-        # Entrypoint for single GPU users
-        if self.use_tp:
-            xlogger.info("Loading with tensor parallel")
+        if self.tp_backend == "mp" and self.use_tp:
+            # Multiprocess TP (ReadyArt fork): one worker process per GPU.
+            # The parent only holds the master rank's shard; all forwards are
+            # collectives driven through TPProcessGroup.
+            xlogger.info("Loading with multiprocess tensor parallel (fork mp backend)")
 
-            # GPU split must be None if the array is empty
-            # Otherwise the TP loader fails
-            for value in self.model.load_tp_gen(
-                self.gpu_split or None,
-                callback_gen=progress_callback,
-                expect_cache_base=cache_class,
-                expect_cache_tokens=self.cache_size,
-            ):
-                if value:
-                    yield value
-        elif not self.gpu_split_auto:
-            xlogger.info("Loading with a manual GPU split (or a one GPU setup)")
+            gpu_split = self.gpu_split
+            if not gpu_split:
+                gpu_split = [
+                    round(torch.cuda.get_device_properties(i).total_memory / 1024**3 - 1.0, 2)
+                    for i in range(torch.cuda.device_count())
+                ]
+                xlogger.info(f"MP auto GPU split (GB): {gpu_split}")
 
-            for value in self.model.load_gen(
-                self.gpu_split,
-                callback_gen=progress_callback,
-            ):
-                if value:
-                    yield value
+            self.tp_group = TPProcessGroup(
+                self.config.model_dir,
+                gpu_split,
+                max_seq_len=self.config.max_seq_len,
+                cache_tokens=self.cache_size,
+                cache_base_name="ExLlamaV2Cache_SWA" if self.is_swa else "ExLlamaV2Cache",
+            )
+            self.tp_group.start()
+            self.model = self.tp_group.model
+            self.cache = self.tp_group.cache
 
-        # Create the model cache
-        self.cache = self.create_cache(
-            cache_class=cache_class,
-            autosplit=self.gpu_split_auto,
-            use_tp=self.use_tp,
-            model=self.model,
-        )
+            # Workers load synchronously inside start(); report a single step
+            if progress_callback:
+                yield from progress_callback(0, 1)
+                yield from progress_callback(1, 1)
+            else:
+                yield 0, 1
+                yield 1, 1
+        else:
+            self.model = ExLlamaV2(self.config)
+            xlogger.info("Loading model: " + self.config.model_dir)
 
-        # Load model with autosplit (without TP)
-        if self.gpu_split_auto and not self.use_tp:
-            xlogger.info("Loading with autosplit")
+            # Load model with manual split
+            # Entrypoint for single GPU users
+            if self.use_tp:
+                xlogger.info("Loading with tensor parallel")
 
-            for value in self.model.load_autosplit_gen(
-                self.cache,
-                reserve_vram=autosplit_reserve,
-                last_id_only=True,
-                callback_gen=progress_callback,
-            ):
-                if value:
-                    yield value
+                # GPU split must be None if the array is empty
+                # Otherwise the TP loader fails
+                for value in self.model.load_tp_gen(
+                    self.gpu_split or None,
+                    callback_gen=progress_callback,
+                    expect_cache_base=cache_class,
+                    expect_cache_tokens=self.cache_size,
+                ):
+                    if value:
+                        yield value
+            elif not self.gpu_split_auto:
+                xlogger.info("Loading with a manual GPU split (or a one GPU setup)")
 
-        # Test VRAM allocation with a full-length forward pass
-        input_ids = torch.zeros((1, self.config.max_input_len), dtype=torch.long)
-        self.model.forward(input_ids, cache=self.cache, preprocess_only=True)
+                for value in self.model.load_gen(
+                    self.gpu_split,
+                    callback_gen=progress_callback,
+                ):
+                    if value:
+                        yield value
+
+            # Create the model cache
+            self.cache = self.create_cache(
+                cache_class=cache_class,
+                autosplit=self.gpu_split_auto,
+                use_tp=self.use_tp,
+                model=self.model,
+            )
+
+            # Load model with autosplit (without TP)
+            if self.gpu_split_auto and not self.use_tp:
+                xlogger.info("Loading with autosplit")
+
+                for value in self.model.load_autosplit_gen(
+                    self.cache,
+                    reserve_vram=autosplit_reserve,
+                    last_id_only=True,
+                    callback_gen=progress_callback,
+                ):
+                    if value:
+                        yield value
+
+            # Test VRAM allocation with a full-length forward pass
+            input_ids = torch.zeros((1, self.config.max_input_len), dtype=torch.long)
+            self.model.forward(input_ids, cache=self.cache, preprocess_only=True)
+
+        # MTP drafter (ReadyArt fork): single-device model that cross-attends to
+        # the target's K/V. Works with single-GPU, SP TP and MP TP targets.
+        if self.use_mtp:
+            xlogger.info(f"Loading MTP drafter: {self.draft_model_dir}")
+            try:
+                # MP: the drafter's target must be the process group itself so
+                # K/V gathers go through gather_kv_mtp (worker pipes).
+                drafter_target = self.tp_group if self.tp_group is not None else self.model
+                self.mtp_drafter = Gemma4AssistantDrafter(
+                    drafter_target,
+                    str(self.draft_model_dir.resolve()),
+                    device=self.draft_device,
+                    num_draft_tokens=self.mtp_window,
+                )
+                if self.tp_group is not None:
+                    self.tp_group.enable_mtp(self.mtp_drafter, num_draft_tokens=self.mtp_window)
+            except Exception as ex:
+                xlogger.warning(
+                    f"Failed to initialize the MTP drafter ({ex}). Disabling MTP."
+                )
+                self.mtp_drafter = None
+                self.use_mtp = False
+                self.fork_mode = self.tp_backend in ("sp", "mp")
 
     # TODO: Maybe make a wrapper class with an ID instead of a utility function
     def get_cache_class(self, cache_mode: str):
@@ -730,15 +994,27 @@ class ExllamaV2Container(BaseModelContainer):
                 await self.wait_for_jobs(skip_wait=True)
 
             # Create new generator
-            self.generator = ExLlamaV2DynamicGeneratorAsync(
-                model=self.model,
-                cache=self.cache,
-                draft_model=self.draft_model,
-                draft_cache=self.draft_cache,
-                tokenizer=self.tokenizer,
-                max_batch_size=self.max_batch_size,
-                paged=self.paged,
-            )
+            if self.fork_mode:
+                # Fork TP/MTP paths: streaming-generator-based async wrapper
+                # (single job at a time), see backends/exllamav2/fork_generator.py
+                self.generator = ExLlamaV2ForkGeneratorAsync(
+                    model=self.model,
+                    cache=self.cache,
+                    tokenizer=self.tokenizer,
+                    tp_group=self.tp_group,
+                    mtp_drafter=self.mtp_drafter,
+                    mtp_window=self.mtp_window,
+                )
+            else:
+                self.generator = ExLlamaV2DynamicGeneratorAsync(
+                    model=self.model,
+                    cache=self.cache,
+                    draft_model=self.draft_model,
+                    draft_cache=self.draft_cache,
+                    tokenizer=self.tokenizer,
+                    max_batch_size=self.max_batch_size,
+                    paged=self.paged,
+                )
 
             # Update the state of the container var
             if self.max_batch_size is None:
@@ -761,6 +1037,16 @@ class ExllamaV2Container(BaseModelContainer):
         """Load loras."""
 
         loras = unwrap(kwargs.get("loras"), [])
+
+        if self.tp_backend == "mp" and loras:
+            xlogger.warning(
+                "LoRAs are not supported with the MP tensor-parallel backend "
+                "(workers load sharded weights without LoRA support)."
+            )
+            return {
+                "success": [],
+                "failure": [lora.get("name") for lora in loras],
+            }
 
         try:
             await self.load_lock.acquire()
@@ -832,9 +1118,16 @@ class ExllamaV2Container(BaseModelContainer):
 
             # Unload the entire model if not just unloading loras
             if not loras_only:
+                # Shut down MP worker processes before freeing the master shard
+                if self.tp_group is not None:
+                    self.tp_group.close()
+                    self.tp_group = None
+
                 if self.model:
                     self.model.unload()
                 self.model = None
+
+                self.mtp_drafter = None
 
                 if self.vision_model:
                     self.vision_model.unload()
@@ -1147,6 +1440,10 @@ class ExllamaV2Container(BaseModelContainer):
             grammar_handler.add_kbnf_filter(params.grammar_string, self.model, self.tokenizer)
 
         # Speculative Ngram
+        if self.use_mtp and params.speculative_ngram:
+            xlogger.warning(
+                "speculative_ngram is ignored while MTP drafting is active."
+            )
         self.generator.speculative_ngram = params.speculative_ngram
 
         # Override sampler settings for temp = 0
@@ -1298,7 +1595,11 @@ class ExllamaV2Container(BaseModelContainer):
         cfg_scale = params.cfg_scale
         negative_prompt = None
         if cfg_scale not in [None, 1.0]:
-            if self.paged:
+            if self.fork_mode:
+                xlogger.warning(
+                    "CFG is not supported by the fork TP/MTP paths. Ignoring cfg_scale."
+                )
+            elif self.paged:
                 gen_settings.cfg_scale = cfg_scale
 
                 # If the negative prompt is empty, use the BOS token
@@ -1334,6 +1635,15 @@ class ExllamaV2Container(BaseModelContainer):
             gen_settings.disallow_tokens(self.tokenizer, eos_tokens)
         else:
             stop_conditions += eos_tokens
+
+        # Gemma-4: also stop when the model opens a new turn (<|turn>). The
+        # end-of-turn token <turn|> and the <|tool_response> guard are already
+        # part of the HF EOS list. Do NOT stop on <channel|>: the reasoning
+        # parser must see the closing thought tag to switch back to content.
+        if self.is_gemma4 and not ban_eos_token:
+            turn_start = self.tokenizer.single_id("<|turn>")
+            if turn_start is not None and turn_start >= 0:
+                stop_conditions = list(stop_conditions) + [turn_start]
 
         # Get multimodal embeddings if present
         mm_embeddings_content = mm_embeddings.content if mm_embeddings else []
@@ -1395,7 +1705,16 @@ class ExllamaV2Container(BaseModelContainer):
 
         # Create and add a new job
         # Don't use the request ID here as there can be multiple jobs per request
-        job = ExLlamaV2DynamicJobAsync(
+        if self.fork_mode:
+            if mm_embeddings_content:
+                raise ValueError(
+                    "Vision input is not supported by the fork TP/MTP paths"
+                )
+            job_cls = ExLlamaV2ForkJobAsync
+        else:
+            job_cls = ExLlamaV2DynamicJobAsync
+
+        job = job_cls(
             self.generator,
             input_ids=input_ids,
             max_new_tokens=max_tokens,
