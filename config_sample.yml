@@ -108,7 +108,23 @@ model:
   # Options: native, nccl
   # Native is recommended for PCIe GPUs
   # NCCL is recommended for NVLink.
+  # ExllamaV2 (ReadyArt fork) additionally supports: sp, mp
+  #   sp: single-process TP driven by the streaming generator. Required for
+  #       sliding-window models (Gemma-4) and supports MTP drafting.
+  #   mp (alias: nccl): one worker process per GPU. Supports MTP drafting
+  #       (greedy requests; non-greedy requests fall back to plain MP decode).
   tensor_parallel_backend: native
+
+  # Capture TP decode steps into CUDA graphs (default: true).
+  # ExllamaV2 ReadyArt fork only (sp/mp backends). Sets EXL2_TP_GRAPHS.
+  tp_graphs: true
+
+  # Cache FlashInfer attention plans keyed on shape (default: false).
+  # ExllamaV2 ReadyArt fork only. Sets EXLLAMA_FLASHINFER_PLAN_CACHE.
+  # Experimental; re-planning per call is the correctness-first default.
+  # FlashInfer itself is a hard requirement of the fork (>= 0.7.4) and is
+  # always enabled; there is no disable switch.
+  flashinfer_plan_cache: false
 
   # Automatically allocate resources to GPUs (default: True).
   # Not parsed for single GPU users.
@@ -190,9 +206,13 @@ model:
 # Options for draft models (speculative decoding)
 # This will use more VRAM!
 draft_model:
-  # Drafting mode for exllamav3 (default: model).
+  # Drafting mode (default: model).
   # Options: model, disabled, mtp, ngram.
   # In `model` mode, drafting is disabled if no draft_model_name is provided.
+  # ExllamaV2 (ReadyArt fork): `mtp` loads a Gemma-4 assistant drafter
+  # (e.g. google/gemma-4-31B-it-assistant) that cross-attends to the target's
+  # K/V. Works with the sp and mp tensor-parallel backends (and single GPU).
+  # `ngram` is exllamav3-only; use the speculative_ngram sampler option for exl2.
   draft_mode: model
 
   # Directory to look for draft models (default: models)
@@ -230,6 +250,17 @@ draft_model:
   # Minimum match length for exllamav3 n-gram drafting (default: 2).
   # Only used when draft_mode is ngram.
   ngram_match_min: 2
+
+  # Device for the MTP drafter (default: 0).
+  # ExllamaV2 ReadyArt fork only. The drafter is a single-device model even
+  # when the target runs tensor-parallel.
+  draft_device: 0
+
+  # Capture the MTP drafter step into a CUDA graph (default: false).
+  # ExllamaV2 ReadyArt fork only. Sets EXL2_MTP_DRAFT_GRAPH.
+  # Experimental: eager FlashInfer drafting is the verified default; the
+  # graphed path is bandwidth-bound at long context.
+  mtp_draft_graph: false
 
 # Options for Sampling
 sampling:

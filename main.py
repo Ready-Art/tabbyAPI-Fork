@@ -133,7 +133,19 @@ def entrypoint(
         )
 
     # We need to configure the allocator before importing Torch
-    if config.memory.cuda_malloc_async:
+    # The exllamav2 fork's MP backend ships rank-local CUDA tensors through
+    # worker pipes (torch IPC reduction); cudaMallocAsync does not support
+    # shareIpcHandle, so keep the existing allocator for that backend.
+    _tp_backend = config.model.tensor_parallel_backend
+    _mp_backend = _tp_backend == "mp" or (
+        _tp_backend == "nccl" and config.model.backend == "exllamav2"
+    )
+    if config.memory.cuda_malloc_async and _mp_backend:
+        xlogger.warning(
+            "Disabling cudaMallocAsync: the exllamav2 MP tensor-parallel backend "
+            "requires CUDA IPC (worker pipes), which cudaMallocAsync does not support."
+        )
+    elif config.memory.cuda_malloc_async:
         env_key1 = "PYTORCH_ALLOC_CONF"
         env_key2 = "PYTORCH_CUDA_ALLOC_CONF"
         new_alloc_config = "backend:cudaMallocAsync"

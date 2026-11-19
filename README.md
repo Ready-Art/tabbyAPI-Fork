@@ -31,8 +31,12 @@
 > Need help? Join the [Discord Server](https://discord.gg/sYQxnuD7Fj) and get the `Tabby` role. Please be nice when asking questions.
 
 > [!NOTE]
-> 
+>
 > Tool calling support has been revamped and now no longer relies on modified Jinja templates. [See the docs for more.](docs/10.-Tool-Calling.md)
+
+> [!NOTE]
+>
+> This branch (`exl2-checkpoint`) adds support for the [ReadyArt ExLlamaV2 fork](https://github.com/Ready-Art/Exllamav2): single-process (`sp`) and multiprocess (`mp`) tensor parallelism, MTP speculative decoding on both, TP CUDA graphs, FlashInfer attention (required by the fork), and Gemma-4 thinking/tool-call handling incl. `reasoning_effort`. [Setup and configuration docs.](docs/11.-ReadyArt-ExLlamaV2-Fork.md)
 
 > [!NOTE]
 > 
@@ -41,6 +45,8 @@
 A FastAPI based application that allows for generating text using an LLM (large language model) using the [Exllamav2](https://github.com/turboderp-org/exllamav2) and [Exllamav3](https://github.com/turboderp-org/exllamav3) backends.
 
 TabbyAPI is also the official API backend server for ExllamaV2 and V3.
+
+**Multi-GPU / MTP:** install this branch with the [ReadyArt ExLlamaV2 fork](https://github.com/Ready-Art/Exllamav2) for tensor parallelism (SP/MP), MTP speculative decoding, CUDA graphs and Gemma-4 thinking/tool calls — see [Installing with the ReadyArt ExLlamaV2 fork](#installing-with-the-readyart-exllamav2-fork-multi-gpu--mtp) below.
 
 ## Disclaimer
 
@@ -72,6 +78,78 @@ docker run --gpus all --name tabbyapi -p 5000:5000 -v /path/to/models:/app/model
 Replace `/path/to/models` with the folder that contains your local model directories. The API is exposed on `http://localhost:5000`.
 
 For Docker Compose, custom config mounts, or building the image locally, see the [Docker instructions](docs/01.-Getting-Started.md#docker).
+
+## Installing with the ReadyArt ExLlamaV2 fork (multi-GPU / MTP)
+
+This branch (`exl2-checkpoint`, public repo: [Ready-Art/TabbyAPI](https://github.com/Ready-Art/TabbyAPI))
+supports the [ReadyArt ExLlamaV2 fork](https://github.com/Ready-Art/Exllamav2): single-process (`sp`)
+and multiprocess (`mp`) tensor parallelism, MTP speculative decoding on both, TP CUDA graphs, and
+Gemma-4 thinking / tool calls. The fork is built and tested on **SM86 (Ampere — RTX 3090)**; other
+architectures are untested.
+
+**Requirements:** a CUDA build of PyTorch, a CUDA toolkit matching it, and **FlashInfer >= 0.7.4**
+(a hard requirement of the fork). Source installs of the fork are detected automatically and work
+with CUDA 13 Torch (prebuilt upstream exllamav2 wheels are CUDA 12 only).
+
+```bash
+# 1. TabbyAPI (this branch)
+git clone https://github.com/Ready-Art/TabbyAPI -b exl2-checkpoint
+cd TabbyAPI
+pip install -e .
+
+# 2. The ReadyArt exllamav2 fork, built from source for your GPU.
+#    TORCH_CUDA_ARCH_LIST: "8.6" for RTX 3090, "8.9" for RTX 4090, etc.
+git clone https://github.com/Ready-Art/Exllamav2
+cd Exllamav2
+TORCH_CUDA_ARCH_LIST="8.6" pip install -e .
+cd ..
+
+# 3. FlashInfer (kernel wheels are CUDA/torch-version specific;
+#    re-run download-kernels after every FlashInfer upgrade)
+pip install "flashinfer-python>=0.7.4"
+flashinfer download-kernels
+
+# 4. Model + MTP drafter
+huggingface-cli download ReadyArt/Gemma-4-31B-IT-EXL2-6.0BPW-HB16 \
+    --local-dir models/Gemma-4-31B-IT-EXL2-6.0BPW-HB16
+huggingface-cli download google/gemma-4-31B-it-assistant \
+    --local-dir models/gemma-4-31B-it-assistant
+```
+
+Minimal `config.yml` for 4 GPUs with MP tensor parallelism + MTP drafting, Gemma-4 thinking and
+tool calls enabled:
+
+```yml
+network:
+  host: 0.0.0.0
+  port: 5000
+
+model:
+  model_dir: models
+  model_name: Gemma-4-31B-IT-EXL2-6.0BPW-HB16
+  backend: exllamav2
+  max_seq_len: 8192
+  cache_size: 8192
+  tensor_parallel: true
+  tensor_parallel_backend: mp     # or sp (single-process)
+  gpu_split: [22, 22, 22, 22]     # GiB per GPU; omit for an even auto split
+  reasoning: true                 # Gemma-4 thought-channel tags are auto-detected
+  tool_format: gemma4             # also auto-detected for Gemma-4
+
+draft_model:
+  draft_mode: mtp
+  draft_model_name: gemma-4-31B-it-assistant
+  draft_num_tokens: 6
+```
+
+Start the server with `python main.py` and point any OpenAI-compatible client at
+`http://localhost:5000/v1`. Thinking is controlled per request via
+`chat_template_kwargs: {"enable_thinking": true}` or `reasoning_effort`
+(`none`/`minimal` off, `low`/`medium`/`high` on).
+
+Notes and limitations (batch size 1 on the fork TP/MTP paths, greedy-only MP MTP with automatic
+fallback for sampling requests, no LoRAs on MP, CUDA graphs and FlashInfer knobs) are documented in
+**[docs/11.-ReadyArt-ExLlamaV2-Fork.md](docs/11.-ReadyArt-ExLlamaV2-Fork.md)**.
 
 ## Features
 
