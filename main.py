@@ -137,17 +137,42 @@ def entrypoint(
     # worker pipes (torch IPC reduction); cudaMallocAsync does not support
     # shareIpcHandle, so keep the existing allocator for that backend.
     _tp_backend = config.model.tensor_parallel_backend
-    _mp_backend = _tp_backend == "mp" or (
+    _fork_tp = _tp_backend in ("sp", "mp") or (
         _tp_backend == "nccl" and config.model.backend == "exllamav2"
     )
-    if config.memory.cuda_malloc_async and _mp_backend:
-        xlogger.warning(
-            "Disabling cudaMallocAsync: the exllamav2 MP tensor-parallel backend "
-            "requires CUDA IPC (worker pipes), which cudaMallocAsync does not support."
-        )
+    env_key1 = "PYTORCH_ALLOC_CONF"
+    env_key2 = "PYTORCH_CUDA_ALLOC_CONF"
+    if _fork_tp:
+        # BUG 102: the ReadyArt exllamav2 fork TP path requires the NATIVE caching
+        # allocator, and we must force it explicitly (a preset PYTORCH_CUDA_ALLOC_CONF
+        # in the environment would otherwise override the choice):
+        #  - MP ships rank-local CUDA tensors through worker pipes (torch IPC
+        #    reduction); cudaMallocAsync does not support shareIpcHandle.
+        #  - SP/MP capture whole-step CUDA graphs. Under cudaMallocAsync, freeing a
+        #    pre-capture allocation during capture ("freeAsync() was called on an
+        #    uncaptured allocation") corrupts graph replay, producing token-level
+        #    garbage (repeated/punctuation/multilingual salad) under sampling. The
+        #    native allocator's graph memory pool handles this correctly.
+        new_alloc_config = "backend:native"
+        prev_alloc_config = os.environ.get(env_key1, os.environ.get(env_key2))
+        os.environ[env_key1] = new_alloc_config
+        os.environ[env_key2] = new_alloc_config
+        import sys
+
+        if "torch" in sys.modules and prev_alloc_config != new_alloc_config:
+            xlogger.warning(
+                "`torch` was imported before config could be loaded. Unable to force the "
+                "native allocator required by the exllamav2 fork TP backend; using existing "
+                "env setting: " + (prev_alloc_config or "(Torch default)")
+            )
+        elif prev_alloc_config and prev_alloc_config != new_alloc_config:
+            xlogger.warning(
+                "Forcing native CUDA allocator for the exllamav2 fork TP backend "
+                "(cudaMallocAsync corrupts fork CUDA-graph replay / breaks MP IPC)."
+            )
+        else:
+            xlogger.info("Configured backend: native (exllamav2 fork TP)")
     elif config.memory.cuda_malloc_async:
-        env_key1 = "PYTORCH_ALLOC_CONF"
-        env_key2 = "PYTORCH_CUDA_ALLOC_CONF"
         new_alloc_config = "backend:cudaMallocAsync"
         prev_alloc_config = os.environ.get(env_key1, os.environ.get(env_key2))
         os.environ[env_key1] = new_alloc_config
