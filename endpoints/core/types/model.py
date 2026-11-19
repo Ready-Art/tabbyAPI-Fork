@@ -24,6 +24,13 @@ class ModelCardParameters(BaseModel):
     prompt_template_content: Optional[str] = None
     use_vision: Optional[bool] = False
 
+    # ReadyArt exllamav2 fork state
+    tensor_parallel: Optional[bool] = False
+    tensor_parallel_backend: Optional[str] = None
+    use_mtp: Optional[bool] = False
+    flashinfer: Optional[bool] = True
+    draft_mode: Optional[str] = None
+
     # Draft is another model, so include it in the card params
     draft: Optional["ModelCard"] = None
 

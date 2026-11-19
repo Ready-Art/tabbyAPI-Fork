@@ -76,6 +76,11 @@ class ChatCompletionRequest(CommonCompletionRequest):
     response_prefix: Optional[str] = None
     model: Optional[str] = None
 
+    # OAI reasoning effort. Passed to the chat template as `reasoning_effort`
+    # and mapped onto `enable_thinking` for templates gated on that switch
+    # (e.g. Gemma-4): none/minimal disable thinking, low/medium/high enable it.
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high"]] = None
+
     # tools is follows the format OAI schema, functions is more flexible
     # both are available in the chat template.
 

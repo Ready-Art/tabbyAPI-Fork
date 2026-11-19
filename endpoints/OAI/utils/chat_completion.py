@@ -268,7 +268,18 @@ async def apply_chat_template(data: ChatCompletionRequest):
                 "functions": data.functions,
             }
         )
-        if model.container.force_enable_thinking:
+        if data.reasoning_effort is not None:
+            # Explicit request-level effort overrides the server-side
+            # force_enable_thinking default. Templates that understand effort
+            # levels can read reasoning_effort directly; for templates gated on
+            # enable_thinking (e.g. Gemma-4), none/minimal turn thinking off and
+            # low/medium/high turn it on.
+            data.template_vars["reasoning_effort"] = data.reasoning_effort
+            data.template_vars["enable_thinking"] = data.reasoning_effort not in (
+                "none",
+                "minimal",
+            )
+        elif model.container.force_enable_thinking:
             data.template_vars.update({"enable_thinking": True})
 
         prompt, mm_embeddings, template_vars = await format_messages_with_template(
