@@ -156,12 +156,15 @@ class _MPModelAdapter:
         if q_len == 0:
             return None
 
+        # preprocess_only discards logits, so only the last row is needed -- computing
+        # full-vocab logits for every chunk and concatenating them OOMs on long prompts
+        # (the non-MTP streaming prefill path; stuff91.txt: 1.5 GiB torch.cat).
         logits = self.pg.forward(
             input_ids.cpu(),
             self.pg.cache.current_seq_len,
             q_len,
             1,
-            last_id_only,
+            last_id_only or preprocess_only,
         )
         return None if preprocess_only else logits
 
