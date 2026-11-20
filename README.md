@@ -71,10 +71,8 @@ For a step-by-step guide, choose the format that works best for you:
 This fork ([Ready-Art/tabbyAPI-Fork](https://github.com/Ready-Art/tabbyAPI-Fork), branch `ReadyArt`)
 supports the [ReadyArt ExLlamaV2 fork](https://github.com/Ready-Art/exllamav2-Fork): single-process (`sp`)
 and multiprocess (`mp`) tensor parallelism, MTP speculative decoding on both, TP CUDA graphs, and
-Gemma-4 thinking / tool calls. The fork is built and tested on **Linux only** (Ubuntu 26.10) and
-on **SM86 (Ampere — RTX 3090)**; **Windows and macOS are untested**, as are other GPU
-architectures. The multiprocess TP backend, CUDA graphs and pinned-host-memory paths are
-Linux-validated only.
+Gemma-4 thinking / tool calls. The fork is built and tested on **SM86 (Ampere — RTX 3090)**; other
+architectures are untested.
 
 **Requirements:** Python 3.12, a CUDA build of PyTorch with a CUDA toolkit (`nvcc` on `PATH`),
 **FlashInfer >= 0.7.4** (a hard requirement of the fork), and **Flash-Attention 2 — required for now
@@ -147,7 +145,7 @@ model:
 draft_model:
   draft_mode: mtp
   draft_model_name: gemma-4-31B-it-assistant
-  draft_num_tokens: 3             # measured MP sweet spot
+  draft_num_tokens: 6
 ```
 
 Start the server with `python main.py` and point any OpenAI-compatible client at
@@ -155,15 +153,8 @@ Start the server with `python main.py` and point any OpenAI-compatible client at
 `chat_template_kwargs: {"enable_thinking": true}` or `reasoning_effort`
 (`none`/`minimal` off, `low`/`medium`/`high` on).
 
-MTP works with the **full sampler on both SP and MP** (probabilistic speculative acceptance —
-temperature-1.0 MP MTP measures **~44 tok/s sustained at ~75k context** on 4× 3090,
-user-confirmed 2026-11-20; ~40-47 tok/s at ~1.3k depending on window).
-**Prompt caching**: chat continuations never re-prefill the conversation — from the second
-reply on, only the last rendered turn + the new message is prefilled, even when the client
-strips thought channels from history (exact SWA-ring restore). Notes and limitations
-(batch size 1 on the fork TP/MTP paths, no LoRAs on MP, banned strings/grammar filters fall back
-to plain MP decoding, CUDA graphs / FlashInfer / sequence-parallel knobs, disconnect aborts,
-long-prompt prefill controls) are documented in
+Notes and limitations (batch size 1 on the fork TP/MTP paths, greedy-only MP MTP with automatic
+fallback for sampling requests, no LoRAs on MP, CUDA graphs and FlashInfer knobs) are documented in
 **[docs/11.-ReadyArt-ExLlamaV2-Fork.md](docs/11.-ReadyArt-ExLlamaV2-Fork.md)**.
 
 ## Features
