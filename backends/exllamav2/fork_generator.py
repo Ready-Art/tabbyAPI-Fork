@@ -211,6 +211,7 @@ class ExLlamaV2ForkGeneratorAsync:
         # The SWA ring is not rewind-safe, so reuse is restricted to prompts that
         # strictly EXTEND this sequence (chat continuations); anything else resets.
         self._cached_ids = None
+        self._cached_pos = 0
         self._cache_valid = False
         self.tp_group = tp_group
         self.mtp_drafter = mtp_drafter
@@ -449,14 +450,14 @@ class ExLlamaV2ForkGeneratorAsync:
             self._record_cache_state(job)
 
     def _record_cache_state(self, job):
-        """Snapshot what the cache holds after an MP MTP job, for append-only reuse.
+        """Snapshot (prompt + every emitted token) and the live cache position.
 
-        At rest the driver's invariant is cache_len == n_prompt + n_emitted - 1:
-        every emitted token is K/V-committed except the last round's bonus, whose
-        K/V the NEXT round's verify writes. The committed content is therefore
-        exactly (prompt + emitted)[:-1]. The invariant is self-validating: a
-        mid-round stop, abort or exception leaves a different cache length and
-        forces a full re-prefill on the next job.
+        The cache position can differ from the snapshot length by a SMALL amount:
+        at rest it is len-1 (the last round's bonus is emitted but K/V-committed
+        by the next verify); a mid-round stop leaves up to W extra committed draft
+        tokens past the emitted prefix. Both are reusable -- see the geometric
+        check in _run_job_mp_mtp_impl. Large deviations (aborted prefill) fail the
+        prefix/overshoot checks there and fall back to a full re-prefill.
         """
         pg = self.tp_group
         ids = getattr(self, "_job_prompt_ids", None)
@@ -466,15 +467,13 @@ class ExLlamaV2ForkGeneratorAsync:
         if ids is None or all_ids is None or pg is None:
             self._cache_valid = False
             return
-        n = ids.shape[-1]
-        e = len(all_ids)
-        c = pg.cache.current_seq_len
-        if not job.abort_event.is_set() and e > 0 and c == n + e - 1:
+        if all_ids:
             full = torch.cat([ids, torch.tensor([all_ids], dtype=torch.long)], dim=-1)
-            self._cached_ids = full[:, :c].contiguous()
-            self._cache_valid = True
         else:
-            self._cache_valid = False
+            full = ids
+        self._cached_ids = full.contiguous()
+        self._cached_pos = pg.cache.current_seq_len
+        self._cache_valid = True
 
     def _run_job_mp_mtp_impl(self, job):
         from exllamav2.mtp_mp import MTPMPDriver
@@ -493,21 +492,45 @@ class ExLlamaV2ForkGeneratorAsync:
         self._job_prompt_ids = ids_cpu
         n_prompt = ids_cpu.shape[-1]
         cached = self._cached_ids if self._cache_valid else None
-        reuse = (
-            cached is not None
-            and n_prompt > cached.shape[-1]
-            and torch.equal(ids_cpu[:, : cached.shape[-1]], cached)
-        )
-        if reuse:
-            pg.abort_flag.clear()
-            prefill_ids = ids_cpu[:, cached.shape[-1]:]
-            xlogger.info(
-                f"MP MTP prompt cache hit: reusing {cached.shape[-1]} tokens, "
-                f"prefilling {n_prompt - cached.shape[-1]} new"
-            )
-        else:
+        reuse = False
+        prefill_ids = ids_cpu
+        if cached is not None:
+            clen = cached.shape[-1]
+            m = min(clen, n_prompt)
+            prefix_ok = torch.equal(ids_cpu[:, :m], cached[:, :m])
+            cpos = self._cached_pos
+            # Reuse only when the new prompt strictly EXTENDS the snapshot and the
+            # cache overshoot is small: -1 (at rest -- the last bonus is emitted but
+            # K/V-committed by the next verify) up to a few extra committed drafts
+            # (mid-round stop). Trimming those few tokens is SWA-ring-safe: the
+            # 1280-deep ring still holds every position below the trim point, and
+            # swa_len truncation ignores the tail slots. Large rewinds (edited or
+            # re-rendered history) are NOT ring-safe -> full reset + re-prefill.
+            overshoot = cpos - clen
+            start = min(cpos, clen)
+            if (prefix_ok and m == clen and n_prompt > start
+                    and -1 <= overshoot <= 8 and clen >= pg.cache.window_beg):
+                reuse = True
+                if cpos > clen:
+                    pg.mtp_set_seq_len(clen)   # distributed trim of unemitted drafts
+                pg.abort_flag.clear()
+                prefill_ids = ids_cpu[:, start:]
+                xlogger.info(
+                    f"MP MTP prompt cache hit: reusing {start} tokens, "
+                    f"prefilling {n_prompt - start} new"
+                )
+            else:
+                if prefix_ok:
+                    why = (f"cache overshoot {overshoot} outside [-1, 8]"
+                           if not (-1 <= overshoot <= 8)
+                           else "prompt does not extend the cached sequence")
+                else:
+                    diff = (ids_cpu[0, :m] != cached[0, :m]).nonzero()
+                    at = int(diff[0]) if diff.numel() else m
+                    why = f"history diverges at token {at} (re-rendered/edited prompt?)"
+                xlogger.info(f"MP MTP prompt cache miss: {why}; full re-prefill")
+        if not reuse:
             pg.mtp_reset_cache()
-            prefill_ids = ids_cpu
         driver = MTPMPDriver(pg, self.mtp_drafter, window=self.mtp_window)
 
         time_start = time.perf_counter()
