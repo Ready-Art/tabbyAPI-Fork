@@ -95,4 +95,15 @@ async def start_api(host: str, port: int):
     )
     server = uvicorn.Server(config)
 
+    # uvicorn's capture_signals replaces SIGINT/SIGTERM with its own handlers, which
+    # wait for open connections to close -- a streaming generation keeps one open
+    # indefinitely, so Ctrl+C never shut the server down. Re-install tabby's handler
+    # (unload + bounded hard exit) as soon as serve() has installed its own.
+    import signal as _signal
+    from common.signals import signal_handler
+    loop.call_soon(lambda: (
+        _signal.signal(_signal.SIGINT, signal_handler),
+        _signal.signal(_signal.SIGTERM, signal_handler),
+    ))
+
     await server.serve()
