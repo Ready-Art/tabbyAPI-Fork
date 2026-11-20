@@ -74,6 +74,20 @@ and multiprocess (`mp`) tensor parallelism, MTP speculative decoding on both, TP
 Gemma-4 thinking / tool calls. The fork is built and tested on **SM86 (Ampere — RTX 3090)**; other
 architectures are untested.
 
+> **Development focus & testing environment.** The majority of the work has gone into the
+> **MP + CUDA graphs + MTP path** (multiprocess TP, whole-step CUDA graphs, Gemma-4 MTP), including
+> a custom PCIe P2P collective kernel. It is tested on **4× RTX 3090 (sm86) on a PCI switch with P2P
+> enabled**, launched with `NCCL_P2P_LEVEL=PXB python main.py` (the `PXB` value depends on your
+> topology). **Other configurations work but are not the priority** — `sp`, the `native` paged
+> backend, non-MTP decoding, other architectures and other model families are functional but get
+> far less optimization effort and **will not match the performance of the MP + CUDA + MTP path**
+> on the tested rig. Only Gemma-4-31B-IT has been tested end-to-end.
+>
+> **Feedback & contributions:** want a change? Open a
+> [GitHub issue](https://github.com/Ready-Art/exllamav2-Fork/issues) (or on
+> [this repo](https://github.com/Ready-Art/tabbyAPI-Fork/issues) for the API integration).
+> **Pull requests are welcome** — open a PR against the `ReadyArt` branch describing what and why.
+
 **Requirements:** Python 3.12, a CUDA build of PyTorch with a CUDA toolkit (`nvcc` on `PATH`),
 **FlashInfer >= 0.7.4** (a hard requirement of the fork), and **Flash-Attention 2 — required for now
 even with FlashInfer** (the fork's TP / dynamic-generator paths still call flash-attn kernels).
@@ -122,39 +136,59 @@ hf download google/gemma-4-31B-it-assistant \
     --local-dir models/gemma-4-31B-it-assistant
 ```
 
-Minimal `config.yml` for 4 GPUs with MP tensor parallelism + MTP drafting, Gemma-4 thinking and
-tool calls enabled:
+Example `config.yml` — **the configuration used on the tested 4× RTX 3090 rig** (MP tensor
+parallelism + MTP drafting, 160k context, Gemma-4 thinking and tool calls enabled). Model paths
+are shown relative (`models/`); point them at your own model directory:
 
 ```yml
 network:
-  host: 0.0.0.0
+  host: 127.0.0.1                 # 0.0.0.0 to accept remote clients
   port: 5000
+  disable_auth: false
+
+memory:
+  cuda_malloc_async: true         # NOTE: the fork TP backends force the native allocator
+                                  # regardless (cudaMallocAsync corrupts TP CUDA-graph replay)
 
 model:
   model_dir: models
   model_name: Gemma-4-31B-IT-EXL2-6.0BPW-HB16
   backend: exllamav2
-  max_seq_len: 8192
-  cache_size: 8192
+  max_seq_len: 160000
+  cache_size: 160000
+  chunk_size: 2048
   tensor_parallel: true
-  tensor_parallel_backend: mp     # or sp (single-process)
-  gpu_split: [22, 22, 22, 22]     # GiB per GPU; omit for an even auto split
+  tensor_parallel_backend: mp     # one worker process per GPU (the primary tested path)
+  gpu_split: [22, 22, 22, 22]     # GiB per GPU (4× 24 GB RTX 3090)
+  tp_graphs: true                 # whole-step TP CUDA graphs
   reasoning: true                 # Gemma-4 thought-channel tags are auto-detected
   tool_format: gemma4             # also auto-detected for Gemma-4
 
 draft_model:
+  draft_model_dir: models
   draft_mode: mtp
   draft_model_name: gemma-4-31B-it-assistant
-  draft_num_tokens: 6
+  draft_num_tokens: 2             # MTP verify window width
+  draft_device: 0
 ```
 
-Start the server with `python main.py` and point any OpenAI-compatible client at
+**Launch the server with P2P enabled** (this is how the tested rig runs it):
+
+```bash
+NCCL_P2P_LEVEL=PXB python main.py
+```
+
+`NCCL_P2P_LEVEL=PXB` enables PCIe peer-to-peer across the PCI switch on the tested 4× RTX 3090
+box. **The right value depends on your topology** — `PXB`/`PHB`/`SYS`/`NODE` describe how far
+apart the GPUs are (see the NCCL docs); on a NVLink rig you would not need this. The fork's custom
+P2P collective kernel also requires peer access between GPUs (it probes `canAccessPeer` and falls
+back to NCCL automatically if unavailable). Then point any OpenAI-compatible client at
 `http://localhost:5000/v1`. Thinking is controlled per request via
 `chat_template_kwargs: {"enable_thinking": true}` or `reasoning_effort`
 (`none`/`minimal` off, `low`/`medium`/`high` on).
 
-Notes and limitations (batch size 1 on the fork TP/MTP paths, greedy-only MP MTP with automatic
-fallback for sampling requests, no LoRAs on MP, CUDA graphs and FlashInfer knobs) are documented in
+Notes and limitations (batch size 1 on the fork TP/MTP paths, full-sampler MTP on both SP and MP,
+no LoRAs on MP, CUDA graphs and FlashInfer knobs) are documented in
 **[docs/11.-ReadyArt-ExLlamaV2-Fork.md](docs/11.-ReadyArt-ExLlamaV2-Fork.md)**.
 
 ## Features
