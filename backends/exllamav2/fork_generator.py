@@ -213,6 +213,11 @@ class ExLlamaV2ForkGeneratorAsync:
         self._cached_ids = None
         self._cached_pos = 0
         self._cache_valid = False
+        # Prompt-boundary ring snapshot position (start of the current cache lineage).
+        # Clients that re-render generated history differently (e.g. strip thought
+        # channels) diverge at this boundary; the saved SWA ring lets us rewind to it
+        # exactly and prefill only the re-rendered tail, keeping the big prompt cached.
+        self._prompt_boundary = 0
         self.tp_group = tp_group
         self.mtp_drafter = mtp_drafter
         self.mtp_window = mtp_window
@@ -493,6 +498,7 @@ class ExLlamaV2ForkGeneratorAsync:
         n_prompt = ids_cpu.shape[-1]
         cached = self._cached_ids if self._cache_valid else None
         reuse = False
+        restored = False
         prefill_ids = ids_cpu
         if cached is not None:
             clen = cached.shape[-1]
@@ -519,6 +525,24 @@ class ExLlamaV2ForkGeneratorAsync:
                     f"MP MTP prompt cache hit: reusing {start} tokens, "
                     f"prefilling {n_prompt - start} new"
                 )
+            elif (self._prompt_boundary > 0
+                    and n_prompt > self._prompt_boundary
+                    and self._prompt_boundary <= clen
+                    and torch.equal(ids_cpu[:, : self._prompt_boundary],
+                                    cached[:, : self._prompt_boundary])
+                    and pg.restore_prompt_ring(self._prompt_boundary)):
+                # History diverges at/after the original prompt boundary (clients
+                # commonly strip thought channels when re-rendering assistant turns).
+                # The saved SWA ring makes the rewind EXACT -- no recompute; only the
+                # re-rendered tail is prefilled, the big prompt stays cached.
+                restored = True
+                pg.abort_flag.clear()
+                prefill_ids = ids_cpu[:, self._prompt_boundary:]
+                xlogger.info(
+                    f"MP MTP prompt cache restore: rewound to prompt boundary "
+                    f"{self._prompt_boundary}, prefilling "
+                    f"{n_prompt - self._prompt_boundary} re-rendered/new tokens"
+                )
             else:
                 if prefix_ok:
                     why = (f"cache overshoot {overshoot} outside [-1, 8]"
@@ -529,7 +553,7 @@ class ExLlamaV2ForkGeneratorAsync:
                     at = int(diff[0]) if diff.numel() else m
                     why = f"history diverges at token {at} (re-rendered/edited prompt?)"
                 xlogger.info(f"MP MTP prompt cache miss: {why}; full re-prefill")
-        if not reuse:
+        if not reuse and not restored:
             pg.mtp_reset_cache()
         driver = MTPMPDriver(pg, self.mtp_drafter, window=self.mtp_window)
 
@@ -542,6 +566,13 @@ class ExLlamaV2ForkGeneratorAsync:
             self._cache_valid = False
             self._finish(job, "abort", 0, "", time_start, time_prefill, time_start)
             return
+
+        if not reuse and not restored:
+            # New cache lineage: save every rank's SWA ring at this prompt boundary
+            # so later requests that re-render the generated history can rewind to
+            # it exactly (ring restore) instead of re-prefilling the whole prompt.
+            pg.snapshot_prompt_ring()
+            self._prompt_boundary = n_prompt
 
         # begin() takes the FULL prompt: its token history and heal base use absolute
         # cache positions. logits/state are the last row of the suffix forward, which
