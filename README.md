@@ -78,7 +78,9 @@ architectures are untested.
 > **MP + CUDA graphs + MTP path** (multiprocess TP, whole-step CUDA graphs, Gemma-4 MTP), including
 > a custom PCIe P2P collective kernel. It is tested on **4× RTX 3090 (sm86) on a PCI switch with P2P
 > enabled**, launched with `NCCL_P2P_LEVEL=PXB python main.py` (the `PXB` value depends on your
-> topology). **Other configurations work but are not the priority** — `sp`, the `native` paged
+> topology). The 3090s are **power-limited to 200 W each via [LACT](https://github.com/ilya-zlobintsev/LACT)**
+> (stock 350 W), so **performance will be significantly better on full-powered GPUs** — the reported
+> numbers are a 200 W-cap lower bound. **Other configurations work but are not the priority** — `sp`, the `native` paged
 > backend, non-MTP decoding, other architectures and other model families are functional but get
 > far less optimization effort and **will not match the performance of the MP + CUDA + MTP path**
 > on the tested rig. Only Gemma-4-31B-IT has been tested end-to-end.
