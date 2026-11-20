@@ -264,7 +264,7 @@ class ExLlamaV2ForkGeneratorAsync:
         # Abort the running job, cancel anything still queued
         job = getattr(self, "_current_job", None)
         if job is not None:
-            job.abort_event.set()
+            self._signal_abort(job)
         while not self._queue.empty():
             queued = self._queue.get_nowait()
             if queued is not None and not queued.cancelled:
@@ -282,6 +282,17 @@ class ExLlamaV2ForkGeneratorAsync:
     def _put(self, job, result):
         if not job.cancelled:
             self._loop.call_soon_threadsafe(job.queue.put_nowait, result)
+
+    def _signal_abort(self, job):
+        """Set BOTH abort signals: the job-level event (checked per emitted token) and
+        the MP prefill flag (checked per prefill chunk on every rank). Without the
+        latter, a disconnected 80k prompt keeps prefilling for minutes after the
+        request is gone -- the token loop never runs until prefill finishes."""
+        job.abort_event.set()
+        pg = getattr(self, "tp_group", None)
+        af = getattr(pg, "abort_flag", None)
+        if af is not None:
+            af.set()
 
     def _run_job(self, job):
         self._current_job = job
@@ -439,6 +450,11 @@ class ExLlamaV2ForkGeneratorAsync:
         time_start = time.perf_counter()
         logits, state = pg.forward_state(job.input_ids.cpu(), last_id_only=True, cpu_logits=True)
         time_prefill = time.perf_counter() - time_start
+        if logits is None or job.abort_event.is_set():
+            # Client disconnected during prefill: every rank aborted at the same chunk
+            # boundary (collective flag in model.forward). Stop instead of generating.
+            self._finish(job, "abort", 0, "", time_start, time_prefill, time_start)
+            return
         driver.begin(job.input_ids, logits, state)
 
         gen_ids: List[int] = []
@@ -644,7 +660,7 @@ class ExLlamaV2ForkJobAsync:
 
     async def cancel(self):
         self.cancelled = True
-        self.abort_event.set()
+        self.generator._signal_abort(self)
         self.queue.put_nowait(
             {
                 "stage": "streaming",

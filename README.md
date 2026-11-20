@@ -145,7 +145,7 @@ model:
 draft_model:
   draft_mode: mtp
   draft_model_name: gemma-4-31B-it-assistant
-  draft_num_tokens: 6
+  draft_num_tokens: 3             # measured MP sweet spot
 ```
 
 Start the server with `python main.py` and point any OpenAI-compatible client at
@@ -153,8 +153,11 @@ Start the server with `python main.py` and point any OpenAI-compatible client at
 `chat_template_kwargs: {"enable_thinking": true}` or `reasoning_effort`
 (`none`/`minimal` off, `low`/`medium`/`high` on).
 
-Notes and limitations (batch size 1 on the fork TP/MTP paths, greedy-only MP MTP with automatic
-fallback for sampling requests, no LoRAs on MP, CUDA graphs and FlashInfer knobs) are documented in
+MTP works with the **full sampler on both SP and MP** (probabilistic speculative acceptance —
+temperature-1.0 MP MTP measures ~40 tok/s at ~1.3k context on 4× 3090). Notes and limitations
+(batch size 1 on the fork TP/MTP paths, no LoRAs on MP, banned strings/grammar filters fall back
+to plain MP decoding, CUDA graphs / FlashInfer / sequence-parallel knobs, disconnect aborts,
+long-prompt prefill controls) are documented in
 **[docs/11.-ReadyArt-ExLlamaV2-Fork.md](docs/11.-ReadyArt-ExLlamaV2-Fork.md)**.
 
 ## Features
