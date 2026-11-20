@@ -207,6 +207,11 @@ class ExLlamaV2ForkGeneratorAsync:
         mtp_window: int = 6,
     ):
         self.tokenizer = tokenizer
+        # Append-only prompt cache (MP MTP): token ids whose K/V is live in the cache.
+        # The SWA ring is not rewind-safe, so reuse is restricted to prompts that
+        # strictly EXTEND this sequence (chat continuations); anything else resets.
+        self._cached_ids = None
+        self._cache_valid = False
         self.tp_group = tp_group
         self.mtp_drafter = mtp_drafter
         self.mtp_window = mtp_window
@@ -333,8 +338,9 @@ class ExLlamaV2ForkGeneratorAsync:
         g.sequence_ids = None
         if self.mp:
             # Full distributed reset (current_seq_len + window_beg on every rank,
-            # plus stale MTP gather buffers)
+            # plus stale MTP gather buffers) -- invalidates the MP MTP prompt cache
             self.tp_group.mtp_reset_cache()
+            self._cache_valid = False
         else:
             self._fresh_cache(g.cache)
 
@@ -437,6 +443,40 @@ class ExLlamaV2ForkGeneratorAsync:
         )
 
     def _run_job_mp_mtp(self, job):
+        try:
+            self._run_job_mp_mtp_impl(job)
+        finally:
+            self._record_cache_state(job)
+
+    def _record_cache_state(self, job):
+        """Snapshot what the cache holds after an MP MTP job, for append-only reuse.
+
+        At rest the driver's invariant is cache_len == n_prompt + n_emitted - 1:
+        every emitted token is K/V-committed except the last round's bonus, whose
+        K/V the NEXT round's verify writes. The committed content is therefore
+        exactly (prompt + emitted)[:-1]. The invariant is self-validating: a
+        mid-round stop, abort or exception leaves a different cache length and
+        forces a full re-prefill on the next job.
+        """
+        pg = self.tp_group
+        ids = getattr(self, "_job_prompt_ids", None)
+        all_ids = getattr(self, "_job_all_ids", None)
+        self._job_prompt_ids = None
+        self._job_all_ids = None
+        if ids is None or all_ids is None or pg is None:
+            self._cache_valid = False
+            return
+        n = ids.shape[-1]
+        e = len(all_ids)
+        c = pg.cache.current_seq_len
+        if not job.abort_event.is_set() and e > 0 and c == n + e - 1:
+            full = torch.cat([ids, torch.tensor([all_ids], dtype=torch.long)], dim=-1)
+            self._cached_ids = full[:, :c].contiguous()
+            self._cache_valid = True
+        else:
+            self._cache_valid = False
+
+    def _run_job_mp_mtp_impl(self, job):
         from exllamav2.mtp_mp import MTPMPDriver
 
         pg = self.tp_group
@@ -444,20 +484,50 @@ class ExLlamaV2ForkGeneratorAsync:
         stop_tokens = {t for t in job.stop_conditions if isinstance(t, int)}
         matcher = _StopStringMatcher([t for t in job.stop_conditions if isinstance(t, str)])
 
-        pg.mtp_reset_cache()
+        # Append-only prompt cache: a chat continuation shares the entire previous
+        # context as a prefix, so keep the K/V and prefill only the new suffix instead
+        # of reprocessing tens of thousands of tokens. The SWA ring's window_beg
+        # bookkeeping is not rewind-safe, so reuse is allowed ONLY for a strict
+        # extension of the cached sequence; any divergence falls back to full reset.
+        ids_cpu = job.input_ids.cpu()
+        self._job_prompt_ids = ids_cpu
+        n_prompt = ids_cpu.shape[-1]
+        cached = self._cached_ids if self._cache_valid else None
+        reuse = (
+            cached is not None
+            and n_prompt > cached.shape[-1]
+            and torch.equal(ids_cpu[:, : cached.shape[-1]], cached)
+        )
+        if reuse:
+            pg.abort_flag.clear()
+            prefill_ids = ids_cpu[:, cached.shape[-1]:]
+            xlogger.info(
+                f"MP MTP prompt cache hit: reusing {cached.shape[-1]} tokens, "
+                f"prefilling {n_prompt - cached.shape[-1]} new"
+            )
+        else:
+            pg.mtp_reset_cache()
+            prefill_ids = ids_cpu
         driver = MTPMPDriver(pg, self.mtp_drafter, window=self.mtp_window)
 
         time_start = time.perf_counter()
-        logits, state = pg.forward_state(job.input_ids.cpu(), last_id_only=True, cpu_logits=True)
+        logits, state = pg.forward_state(prefill_ids, last_id_only=True, cpu_logits=True)
         time_prefill = time.perf_counter() - time_start
         if logits is None or job.abort_event.is_set():
             # Client disconnected during prefill: every rank aborted at the same chunk
             # boundary (collective flag in model.forward). Stop instead of generating.
+            self._cache_valid = False
             self._finish(job, "abort", 0, "", time_start, time_prefill, time_start)
             return
+
+        # begin() takes the FULL prompt: its token history and heal base use absolute
+        # cache positions. logits/state are the last row of the suffix forward, which
+        # is the last prompt token on both the reuse and the fresh-prefill paths.
         driver.begin(job.input_ids, logits, state)
 
         gen_ids: List[int] = []
+        all_ids: List[int] = []   # every consumed token, incl. suppressed stop tokens
+        self._job_all_ids = all_ids
         seq_ids = job.input_ids.clone()
         emitted = ""
         new_tokens = 0
@@ -481,6 +551,7 @@ class ExLlamaV2ForkGeneratorAsync:
 
             ban = list(stop_tokens) if new_tokens < job.min_new_tokens else None
             tok = int(driver.step(settings, self.tokenizer, seq_ids, ban_tokens=ban))
+            all_ids.append(tok)
             new_tokens += 1
             seq_ids = torch.cat([seq_ids, torch.tensor([[tok]], dtype=torch.long)], dim=-1)
 
