@@ -154,7 +154,10 @@ Start the server with `python main.py` and point any OpenAI-compatible client at
 (`none`/`minimal` off, `low`/`medium`/`high` on).
 
 MTP works with the **full sampler on both SP and MP** (probabilistic speculative acceptance —
-temperature-1.0 MP MTP measures ~40 tok/s at ~1.3k context on 4× 3090). Notes and limitations
+temperature-1.0 MP MTP measures ~40 tok/s at both ~1.3k and ~75k context on 4× 3090).
+**Prompt caching**: chat continuations never re-prefill the conversation — from the second
+reply on, only the last rendered turn + the new message is prefilled, even when the client
+strips thought channels from history (exact SWA-ring restore). Notes and limitations
 (batch size 1 on the fork TP/MTP paths, no LoRAs on MP, banned strings/grammar filters fall back
 to plain MP decoding, CUDA graphs / FlashInfer / sequence-parallel knobs, disconnect aborts,
 long-prompt prefill controls) are documented in
