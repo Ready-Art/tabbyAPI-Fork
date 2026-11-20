@@ -213,10 +213,11 @@ class ExLlamaV2ForkGeneratorAsync:
         self._cached_ids = None
         self._cached_pos = 0
         self._cache_valid = False
-        # Prompt-boundary ring snapshot position (start of the current cache lineage).
-        # Clients that re-render generated history differently (e.g. strip thought
-        # channels) diverge at this boundary; the saved SWA ring lets us rewind to it
-        # exactly and prefill only the re-rendered tail, keeping the big prompt cached.
+        # Prompt-boundary ring snapshot position = the PREVIOUS job's prompt length.
+        # Clients that re-render generated history (e.g. strip thought channels)
+        # diverge exactly there (the latest assistant turn); the saved SWA ring lets
+        # us rewind to it exactly and prefill only the last rendered turn + the new
+        # message, keeping the whole earlier conversation cached.
         self._prompt_boundary = 0
         self.tp_group = tp_group
         self.mtp_drafter = mtp_drafter
@@ -567,12 +568,16 @@ class ExLlamaV2ForkGeneratorAsync:
             self._finish(job, "abort", 0, "", time_start, time_prefill, time_start)
             return
 
-        if not reuse and not restored:
-            # New cache lineage: save every rank's SWA ring at this prompt boundary
-            # so later requests that re-render the generated history can rewind to
-            # it exactly (ring restore) instead of re-prefilling the whole prompt.
-            pg.snapshot_prompt_ring()
-            self._prompt_boundary = n_prompt
+        # Save every rank's SWA ring at THIS prompt's end -- on every path (fresh,
+        # extension, restore). A client that re-renders generated history (e.g.
+        # strips thought channels) always diverges at the PREVIOUS prompt's end
+        # (the latest assistant turn), so the latest snapshot is exactly the one
+        # the next reply needs: each reply restores to the previous prompt boundary
+        # and prefills only the last rendered turn + the new message -- a constant
+        # tail, instead of re-prefilling the whole rendered history every turn.
+        # One backup buffer (~262 MB/rank), replaced per job; no growth.
+        pg.snapshot_prompt_ring()
+        self._prompt_boundary = n_prompt
 
         # begin() takes the FULL prompt: its token history and heal base use absolute
         # cache positions. logits/state are the last row of the suffix forward, which
