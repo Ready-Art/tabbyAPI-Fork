@@ -2,6 +2,7 @@
 
 import asyncio
 import gc
+import json
 import math
 import os
 import pathlib
@@ -73,6 +74,11 @@ except ImportError:
     Gemma4AssistantDrafter = None
     TPProcessGroup = None
 
+try:
+    from exllamav2.dflash_drafter import DFlashDrafter
+except ImportError:
+    DFlashDrafter = None
+
 
 class ExllamaV2Container(BaseModelContainer):
     """The model container class for ExLlamaV2 models."""
@@ -116,6 +122,7 @@ class ExllamaV2Container(BaseModelContainer):
     # ReadyArt fork vars (TP backends, MTP drafting, FlashInfer, CUDA graphs)
     tp_backend: str = "native"
     use_mtp: bool = False
+    use_dflash: bool = False
     mtp_drafter: Optional[object] = None
     mtp_window: int = 6
     draft_device: int = 0
@@ -210,14 +217,18 @@ class ExllamaV2Container(BaseModelContainer):
         draft_model_name = draft_args.get("draft_model_name")
         draft_mode = unwrap(draft_args.get("draft_mode"), "model")
 
-        # MTP drafting (ReadyArt fork): a Gemma-4 assistant drafter that
-        # cross-attends to the target's K/V instead of a standalone draft model
-        self.use_mtp = draft_mode == "mtp"
+        # Fork speculative drafting (ReadyArt fork): either the Gemma-4 MTP
+        # assistant (cross-attends to the target's K/V) or a DFlash block-diffusion
+        # drafter (conditions on target hidden states, drafts a whole block in
+        # one parallel pass). Both ride the same verify/accept round protocol.
+        self.use_mtp = draft_mode in ("mtp", "dflash")
+        self.use_dflash = draft_mode == "dflash"
         if self.use_mtp:
             if not draft_model_name:
                 raise ValueError(
-                    "draft_mode 'mtp' requires draft_model_name "
-                    "(e.g. google/gemma-4-31B-it-assistant downloaded into the draft model dir)"
+                    "draft_mode 'mtp'/'dflash' requires draft_model_name "
+                    "(e.g. google/gemma-4-31B-it-assistant or z-lab/gemma-4-31B-it-DFlash "
+                    "downloaded into the draft model dir)"
                 )
             if Gemma4AssistantDrafter is None:
                 xlogger.warning(
@@ -225,20 +236,53 @@ class ExllamaV2Container(BaseModelContainer):
                     "(exllamav2.mtp_drafter). Disabling MTP."
                 )
                 self.use_mtp = False
+                self.use_dflash = False
             else:
                 self.draft_model_dir = (
                     pathlib.Path(unwrap(draft_args.get("draft_model_dir"), "models"))
                     / draft_model_name
                 )
-                self.mtp_window = unwrap(draft_args.get("draft_num_tokens"), 6)
-                self.draft_device = unwrap(draft_args.get("draft_device"), 0)
-                os.environ["EXL2_MTP_DRAFT_GRAPH"] = (
-                    "1" if unwrap(draft_args.get("mtp_draft_graph"), False) else "0"
-                )
-                xlogger.info(
-                    f"MTP drafting enabled: {self.draft_model_dir} "
-                    f"(window {self.mtp_window}, device cuda:{self.draft_device})"
-                )
+                # Auto-detect DFlash checkpoints: their config.json carries a
+                # dflash_config block. Routing an 'mtp' config at a DFlash model
+                # would fail the assistant weight load, so route it correctly.
+                _dcfg = self.draft_model_dir / "config.json"
+                if not self.use_dflash and _dcfg.exists():
+                    try:
+                        with open(_dcfg, encoding="utf-8") as f:
+                            self.use_dflash = "dflash_config" in json.load(f)
+                        if self.use_dflash:
+                            xlogger.info(
+                                "Draft checkpoint is a DFlash model; "
+                                "using the DFlash drafter."
+                            )
+                    except (OSError, ValueError):
+                        pass
+                if self.use_dflash and DFlashDrafter is None:
+                    xlogger.warning(
+                        "DFlash drafting requires the ReadyArt exllamav2 fork "
+                        "(exllamav2.dflash_drafter). Disabling drafting."
+                    )
+                    self.use_mtp = False
+                    self.use_dflash = False
+                else:
+                    # DFlash default window is the checkpoint's block_size - 1
+                    # (resolved at load); 16 here is provisional headroom for
+                    # max_output_len until the drafter reports its window.
+                    self._draft_window_cfg = draft_args.get("draft_num_tokens")
+                    self.mtp_window = unwrap(
+                        draft_args.get("draft_num_tokens"),
+                        16 if self.use_dflash else 6,
+                    )
+                    self.draft_device = unwrap(draft_args.get("draft_device"), 0)
+                    if not self.use_dflash:
+                        os.environ["EXL2_MTP_DRAFT_GRAPH"] = (
+                            "1" if unwrap(draft_args.get("mtp_draft_graph"), False) else "0"
+                        )
+                    xlogger.info(
+                        f"{'DFlash' if self.use_dflash else 'MTP'} drafting enabled: "
+                        f"{self.draft_model_dir} "
+                        f"(window {self.mtp_window}, device cuda:{self.draft_device})"
+                    )
 
         if draft_mode == "ngram":
             xlogger.warning(
@@ -375,10 +419,22 @@ class ExllamaV2Container(BaseModelContainer):
                 self.use_tp = False
                 self.gpu_split_auto = True
 
-        # MTP drafting rides on the streaming generator, not the dynamic one
+        # MTP drafting rides on the streaming generator, not the dynamic one.
+        # DFlash requires the MP backend (aux states cross the worker pipes).
         if self.use_mtp and self.use_tp and self.tp_backend == "native":
-            xlogger.info("MTP drafting with TP: switching to the fork 'sp' backend.")
-            self.tp_backend = "sp"
+            if self.use_dflash:
+                xlogger.info("DFlash drafting with TP: switching to the fork 'mp' backend.")
+                self.tp_backend = "mp"
+            else:
+                xlogger.info("MTP drafting with TP: switching to the fork 'sp' backend.")
+                self.tp_backend = "sp"
+        if self.use_dflash and self.tp_backend != "mp":
+            xlogger.warning(
+                "DFlash drafting requires the fork 'mp' tensor-parallel backend "
+                "(tensor_parallel_backend: mp). Disabling DFlash."
+            )
+            self.use_mtp = False
+            self.use_dflash = False
 
         self.fork_mode = self.use_mtp or self.tp_backend in ("sp", "mp")
 
@@ -406,6 +462,12 @@ class ExllamaV2Container(BaseModelContainer):
         # Set max batch size to the config override
         self.max_batch_size = unwrap(kwargs.get("max_batch_size"))
         if self.fork_mode:
+            if self.use_dflash and self.max_batch_size is not None and self.max_batch_size > 1:
+                xlogger.warning(
+                    "DFlash drafting currently supports max_batch_size 1 only; "
+                    "limiting max_batch_size to 1."
+                )
+                self.max_batch_size = 1
             if self.tp_backend == "mp" and self.use_mtp:
                 # MP + MTP supports slot-based multi-batch: one cache row per concurrent
                 # job, batched graphed verify rounds, per-slot prompt cache. VRAM scales
@@ -663,7 +725,8 @@ class ExllamaV2Container(BaseModelContainer):
         elif self.use_mtp:
             draft_model_card = ModelCard(
                 id=self.draft_model_dir.name,
-                parameters=ModelCardParameters(draft_mode="mtp"),
+                parameters=ModelCardParameters(
+                    draft_mode="dflash" if self.use_dflash else "mtp"),
             )
 
         model_params = ModelCardParameters(
@@ -934,28 +997,46 @@ class ExllamaV2Container(BaseModelContainer):
             input_ids = torch.zeros((1, self.config.max_input_len), dtype=torch.long)
             self.model.forward(input_ids, cache=self.cache, preprocess_only=True)
 
-        # MTP drafter (ReadyArt fork): single-device model that cross-attends to
-        # the target's K/V. Works with single-GPU, SP TP and MP TP targets.
+        # Fork drafter (ReadyArt): single-device model in the parent process.
+        # MTP assistant cross-attends to the target's K/V (single-GPU, SP, MP);
+        # DFlash conditions on the target's aux hidden states (MP only).
         if self.use_mtp:
-            xlogger.info(f"Loading MTP drafter: {self.draft_model_dir}")
+            xlogger.info(
+                f"Loading {'DFlash' if self.use_dflash else 'MTP'} drafter: "
+                f"{self.draft_model_dir}"
+            )
             try:
                 # MP: the drafter's target must be the process group itself so
-                # K/V gathers go through gather_kv_mtp (worker pipes).
+                # gathers / aux states go through the worker pipes.
                 drafter_target = self.tp_group if self.tp_group is not None else self.model
-                self.mtp_drafter = Gemma4AssistantDrafter(
-                    drafter_target,
-                    str(self.draft_model_dir.resolve()),
-                    device=self.draft_device,
-                    num_draft_tokens=self.mtp_window,
-                )
+                if self.use_dflash:
+                    self.mtp_drafter = DFlashDrafter(
+                        drafter_target,
+                        str(self.draft_model_dir.resolve()),
+                        device=self.draft_device,
+                        num_draft_tokens=self._draft_window_cfg,
+                    )
+                    # The checkpoint's block_size resolves the actual window.
+                    self.mtp_window = self.mtp_drafter.num_draft_tokens
+                    self.config.max_output_len = max(16, self.mtp_window + 1)
+                else:
+                    self.mtp_drafter = Gemma4AssistantDrafter(
+                        drafter_target,
+                        str(self.draft_model_dir.resolve()),
+                        device=self.draft_device,
+                        num_draft_tokens=self.mtp_window,
+                    )
                 if self.tp_group is not None:
                     self.tp_group.enable_mtp(self.mtp_drafter, num_draft_tokens=self.mtp_window)
             except Exception as ex:
                 xlogger.warning(
-                    f"Failed to initialize the MTP drafter ({ex}). Disabling MTP."
+                    f"Failed to initialize the "
+                    f"{'DFlash' if self.use_dflash else 'MTP'} drafter ({ex}). "
+                    f"Disabling drafting."
                 )
                 self.mtp_drafter = None
                 self.use_mtp = False
+                self.use_dflash = False
                 self.fork_mode = self.tp_backend in ("sp", "mp")
 
     # TODO: Maybe make a wrapper class with an ID instead of a utility function

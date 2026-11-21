@@ -644,6 +644,28 @@ class ExLlamaV2ForkGeneratorAsync:
     def _run_job_mp_mtp(self, job):
         try:
             self._run_job_mp_mtp_impl(job)
+        except torch.OutOfMemoryError:
+            # Self-diagnosing OOM: dump the component VRAM + context state at the
+            # failure point so one run localizes the culprit (aux staging, draft
+            # KV, graph pools, prefill transients) without a guess-and-check cycle.
+            try:
+                pg = self.tp_group
+                d = self.mtp_drafter
+                per = " ".join(
+                    f"dev{i}={torch.cuda.memory_allocated(i) / 2**20:.0f}/"
+                    f"{torch.cuda.memory_reserved(i) / 2**20:.0f}"
+                    for i in range(torch.cuda.device_count()))
+                stag = getattr(pg.model, "_dflash_aux_staging", None)
+                xlogger.error(
+                    f"[dflash-oom] alloc/reserved MiB: {per} | "
+                    f"prompt={job.input_ids.shape[-1]} "
+                    f"cache_pos={pg.cache.current_seq_len} "
+                    f"draft_ctx={getattr(d, 'ctx_len', -1)} "
+                    f"draft_gpu={getattr(d, 'footprint', lambda: 0)() / 2**20:.0f} MiB "
+                    f"aux_staging={tuple(stag.shape) if stag is not None else None}")
+            except Exception:
+                pass
+            raise
         finally:
             self._record_cache_state(job)
 
@@ -692,6 +714,9 @@ class ExLlamaV2ForkGeneratorAsync:
         cached = self._cached_ids if self._cache_valid else None
         reuse = False
         restored = False
+        restore_pos = 0   # the OLD prompt boundary restored to (DFlash aux_p0);
+                          # captured here because _prompt_boundary is overwritten
+                          # with the new prompt length before begin() below
         prefill_ids = ids_cpu
         if cached is not None:
             clen = cached.shape[-1]
@@ -707,11 +732,21 @@ class ExLlamaV2ForkGeneratorAsync:
             # re-rendered history) are NOT ring-safe -> full reset + re-prefill.
             overshoot = cpos - clen
             start = min(cpos, clen)
+            # Negative overshoot down to -(W+1): a mid-queue stop leaves up to
+            # W+1 decided-but-uncommitted tokens (common with DFlash's larger
+            # windows). Reuse stays safe at ANY pending length: no rewind
+            # happens -- prefill continues FORWARD from cpos, rewriting those
+            # tokens' K/V (the ring only ever moves forward here).
             if (prefix_ok and m == clen and n_prompt > start
-                    and -1 <= overshoot <= 8 and clen >= pg.cache.window_beg):
+                    and -(self.mtp_window + 1) <= overshoot <= 8
+                    and clen >= pg.cache.window_beg):
                 reuse = True
                 if cpos > clen:
                     pg.mtp_set_seq_len(clen)   # distributed trim of unemitted drafts
+                # DFlash: the draft KV context for the reused prefix is still
+                # valid (same lineage); trim its length to the prefill start.
+                if getattr(self.mtp_drafter, "is_dflash", False):
+                    self.mtp_drafter.trim(start)
                 pg.abort_flag.clear()
                 prefill_ids = ids_cpu[:, start:]
                 xlogger.info(
@@ -729,6 +764,7 @@ class ExLlamaV2ForkGeneratorAsync:
                 # The saved SWA ring makes the rewind EXACT -- no recompute; only the
                 # re-rendered tail is prefilled, the big prompt stays cached.
                 restored = True
+                restore_pos = self._prompt_boundary
                 pg.abort_flag.clear()
                 prefill_ids = ids_cpu[:, self._prompt_boundary:]
                 xlogger.info(
@@ -738,8 +774,9 @@ class ExLlamaV2ForkGeneratorAsync:
                 )
             else:
                 if prefix_ok:
-                    why = (f"cache overshoot {overshoot} outside [-1, 8]"
-                           if not (-1 <= overshoot <= 8)
+                    why = (f"cache overshoot {overshoot} outside "
+                           f"[{-(self.mtp_window + 1)}, 8]"
+                           if not (-(self.mtp_window + 1) <= overshoot <= 8)
                            else "prompt does not extend the cached sequence")
                 else:
                     diff = (ids_cpu[0, :m] != cached[0, :m]).nonzero()
@@ -749,9 +786,18 @@ class ExLlamaV2ForkGeneratorAsync:
         if not reuse and not restored:
             pg.mtp_reset_cache()
         driver = MTPMPDriver(pg, self.mtp_drafter, window=self.mtp_window)
+        dflash = getattr(self.mtp_drafter, "is_dflash", False)
 
         time_start = time.perf_counter()
-        logits, state = pg.forward_state(prefill_ids, last_id_only=True, cpu_logits=True)
+        if dflash:
+            # DFlash: the prefill also returns the per-token aux states (the
+            # target-layer residual taps) that become the draft KV context.
+            r = pg.forward_state(prefill_ids, last_id_only=True, cpu_logits=True,
+                                 return_row_aux=True)
+            logits, state, aux = r if r is not None else (None, None, None)
+        else:
+            logits, state = pg.forward_state(prefill_ids, last_id_only=True, cpu_logits=True)
+            aux = None
         time_prefill = time.perf_counter() - time_start
         if logits is None or job.abort_event.is_set():
             # Client disconnected during prefill: every rank aborted at the same chunk
@@ -774,7 +820,14 @@ class ExLlamaV2ForkGeneratorAsync:
         # begin() takes the FULL prompt: its token history and heal base use absolute
         # cache positions. logits/state are the last row of the suffix forward, which
         # is the last prompt token on both the reuse and the fresh-prefill paths.
-        driver.begin(job.input_ids, logits, state)
+        # DFlash: the aux rows cover only the tokens prefilled THIS job, at aux_p0
+        # (0 fresh, the reuse start, or the OLD boundary captured at restore time --
+        # self._prompt_boundary already holds the NEW prompt length here).
+        if dflash:
+            aux_p0 = start if reuse else (restore_pos if restored else 0)
+            driver.begin(job.input_ids, logits, state, aux=aux, aux_p0=aux_p0)
+        else:
+            driver.begin(job.input_ids, logits, state)
 
         gen_ids: List[int] = []
         all_ids: List[int] = []   # every consumed token, incl. suppressed stop tokens
@@ -1034,7 +1087,8 @@ class ExLlamaV2ForkGeneratorAsync:
             overshoot = cpos - clen
             start = min(cpos, clen)
             if (prefix_ok and m == clen and n_prompt > start
-                    and -1 <= overshoot <= 8 and clen >= pg.cache.window_begs[r]):
+                    and -(self.mtp_window + 1) <= overshoot <= 8
+                    and clen >= pg.cache.window_begs[r]):
                 reuse = True
                 if cpos > clen:
                     pg.mtp_set_seq_len_row(r, clen)
@@ -1059,8 +1113,9 @@ class ExLlamaV2ForkGeneratorAsync:
                 )
             else:
                 if prefix_ok:
-                    why = (f"cache overshoot {overshoot} outside [-1, 8]"
-                           if not (-1 <= overshoot <= 8)
+                    why = (f"cache overshoot {overshoot} outside "
+                           f"[{-(self.mtp_window + 1)}, 8]"
+                           if not (-(self.mtp_window + 1) <= overshoot <= 8)
                            else "prompt does not extend the cached sequence")
                 else:
                     diff = (ids_cpu[0, :m] != cached[0, :m]).nonzero()

@@ -369,16 +369,21 @@ class DraftModelConfig(BaseConfigModel):
     This will use more VRAM!
     """
 
-    draft_mode: Optional[Literal["model", "disabled", "mtp", "ngram"]] = Field(
+    draft_mode: Optional[Literal["model", "disabled", "mtp", "dflash", "ngram"]] = Field(
         "model",
         description=(
             "Drafting mode (default: model).\n"
-            "Options: model, disabled, mtp, ngram.\n"
+            "Options: model, disabled, mtp, dflash, ngram.\n"
             "In `model` mode, drafting is disabled if no draft_model_name is provided.\n"
             "ExllamaV2 (ReadyArt fork): `mtp` loads a Gemma-4 assistant drafter\n"
             "(e.g. google/gemma-4-31B-it-assistant) that cross-attends to the target's\n"
-            "K/V. Works with the sp and mp tensor-parallel backends. `ngram` is not\n"
-            "supported by the exllamav2 fork paths."
+            "K/V. Works with the sp and mp tensor-parallel backends.\n"
+            "`dflash` loads a DFlash block-diffusion drafter\n"
+            "(e.g. z-lab/gemma-4-31B-it-DFlash) that drafts a whole block in one\n"
+            "parallel pass, conditioned on the target's hidden states (FlashInfer\n"
+            "attention). Requires the mp tensor-parallel backend and max_batch_size 1.\n"
+            "A DFlash checkpoint is also auto-detected under `mtp` mode.\n"
+            "`ngram` is not supported by the exllamav2 fork paths."
         ),
     )
     # TODO: convert this to a pathlib.path?

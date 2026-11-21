@@ -199,6 +199,14 @@ multi-batch** opt-in via `max_batch_size` on MP + MTP, full-sampler MTP on both 
 no LoRAs on MP, CUDA graphs and FlashInfer knobs) are documented in
 **[docs/11.-ReadyArt-ExLlamaV2-Fork.md](docs/11.-ReadyArt-ExLlamaV2-Fork.md)**.
 
+**DFlash (experimental):** the fork also supports
+[z-lab's DFlash](https://huggingface.co/z-lab/gemma-4-31B-it-DFlash) block-diffusion drafter —
+a whole block (anchor + up to 15 masks) drafted in one parallel pass, FlashInfer attention.
+Set `draft_mode: dflash` with `draft_model_name: gemma-4-31B-it-DFlash` (MP backend,
+`max_batch_size: 1`; larger windows favor DFlash). See the
+[DFlash section](docs/11.-ReadyArt-ExLlamaV2-Fork.md#dflash-block-diffusion-drafting-experimental-mp)
+of the fork docs.
+
 ## Features
 
 - OpenAI compatible API
