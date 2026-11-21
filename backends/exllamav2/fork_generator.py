@@ -16,7 +16,12 @@ ExLlamaV2DynamicGeneratorAsync / ExLlamaV2DynamicJobAsync: jobs are async
 iterables yielding dicts with stage="streaming", and the final dict carries
 eos + metrics (prompt_tokens, cached_tokens, time_prefill, ...).
 
-Only one job runs at a time (batch size 1): these paths own a single cache.
+With max_batch == 1 (the default) one job runs at a time: these paths own a single
+cache. With max_batch > 1 (MP + MTP only, opt-in via the container's max_batch_size)
+a slot scheduler runs up to max_batch concurrent jobs: one cache row per job,
+serialized chunked prefills interleaved with shared batched graphed MTP verify
+rounds, and a per-slot append-only prompt cache (reuse only on strict prefix
+extension of the slot's own lineage -- slots never share K/V).
 """
 
 from __future__ import annotations
@@ -194,6 +199,133 @@ class _MPCacheProxy:
         return getattr(self._pg.cache, name)
 
 
+class _MPModelAdapterRow(_MPModelAdapter):
+    """
+    Row-scoped MP adapter for plain (non-MTP) solo runs in multi-batch mode: every
+    forward targets ONE cache row. Prefill chunks go through the eager row path;
+    single-token decode uses the batched graph machinery at B=1 (row_map=[r]) and
+    advances the row's position explicitly (forward_batch, like the MTP driver,
+    leaves bookkeeping to its caller).
+    """
+
+    def __init__(self, tp_group, row):
+        super().__init__(tp_group)
+        self.row = row
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        cache,
+        preprocess_only: bool = False,
+        last_id_only: bool = False,
+        loras=None,
+        input_mask=None,
+        position_offsets=None,
+        abort_event=None,
+        indexed_embeddings=None,
+        **kwargs,
+    ):
+        if loras:
+            raise ValueError("LoRAs are not supported with the MP tensor-parallel backend")
+        if input_mask is not None or position_offsets is not None:
+            raise ValueError("input_mask/position_offsets are not supported with the MP backend")
+        if indexed_embeddings is not None:
+            raise ValueError("Multimodal embeddings are not supported with the MP backend")
+        if kwargs.get("return_last_state"):
+            raise ValueError("return_last_state is not supported through the MP adapter")
+
+        q_len = input_ids.shape[-1]
+        if q_len == 0:
+            return None
+        r = self.row
+        if q_len == 1 and not preprocess_only:
+            logits = self.pg.forward_batch(
+                input_ids.cpu(), [self.pg.cache.seq_lens[r]], [r],
+                last_id_only=last_id_only,
+            )
+            self.pg.mtp_set_seq_len_row(r, self.pg.cache.seq_lens[r] + 1)
+            return logits
+        return self.pg.forward_row(
+            r, input_ids.cpu(), last_id_only or preprocess_only, preprocess_only
+        )
+
+
+class _MPCacheProxyRow:
+    """
+    Row-scoped cache facade for the streaming generator: current_seq_len reads/writes
+    map to seq_lens[row] (writes fan out to every worker), window_beg to
+    window_begs[row]; everything else delegates to the persistent row view.
+    """
+
+    def __init__(self, tp_group, row):
+        object.__setattr__(self, "_pg", tp_group)
+        object.__setattr__(self, "_row", row)
+
+    @property
+    def current_seq_len(self):
+        return self._pg.cache.seq_lens[self._row]
+
+    def __setattr__(self, name, value):
+        if name == "current_seq_len":
+            self._pg.mtp_set_seq_len_row(self._row, int(value))
+        elif name == "window_beg":
+            self._pg.cache.window_begs[self._row] = int(value)
+        else:
+            setattr(self._pg.cache.row_view(self._row), name, value)
+
+    def __getattr__(self, name):
+        return getattr(self._pg.cache.row_view(self._row), name)
+
+
+class _Slot:
+    """One cache row of the multi-batch scheduler: the live job (if any) plus the
+    slot's append-only prompt-cache lineage. The lineage survives job completion so
+    a chat continuation admitted to the same slot reuses its K/V; a job whose prompt
+    does not extend the lineage resets the row (never cross-contaminates)."""
+
+    def __init__(self):
+        self.job = None
+        self.state = None
+        self.active = False
+        self.cached_ids = None
+        self.cached_pos = 0
+        self.cache_valid = False
+        self.prompt_boundary = 0
+        self.cached_tokens = 0
+
+
+class _BatchJobState:
+    """Per-job generation bookkeeping for the batched token loop (mirrors the local
+    variables of the sequential _run_job_mp_mtp_impl)."""
+
+    def __init__(self, job, time_start, time_prefill):
+        self.job = job
+        self.stop_tokens = {t for t in job.stop_conditions if isinstance(t, int)}
+        self.matcher = _StopStringMatcher(
+            [t for t in job.stop_conditions if isinstance(t, str)]
+        )
+        self.gen_ids: List[int] = []
+        self.all_ids: List[int] = []
+        self.seq_ids = job.input_ids.clone()
+        self.emitted = ""
+        self.new_tokens = 0
+        self.time_start = time_start
+        self.time_prefill = time_prefill
+        self.time_gen_start = time.perf_counter()
+
+    def decode_full(self, tokenizer) -> str:
+        if not self.gen_ids:
+            return ""
+        return tokenizer.decode(
+            torch.tensor([self.gen_ids], dtype=torch.long),
+            decode_special_tokens=self.job.decode_special_tokens,
+        )[0]
+
+    def pending_text(self, tokenizer) -> str:
+        full = self.decode_full(tokenizer)
+        return full[len(self.emitted):] if full.startswith(self.emitted) else ""
+
+
 class ExLlamaV2ForkGeneratorAsync:
     """
     Async wrapper running fork TP/MTP jobs sequentially on a worker thread.
@@ -208,6 +340,7 @@ class ExLlamaV2ForkGeneratorAsync:
         tp_group=None,
         mtp_drafter=None,
         mtp_window: int = 6,
+        max_batch: int = 1,
     ):
         self.tokenizer = tokenizer
         # Append-only prompt cache (MP MTP): token ids whose K/V is live in the cache.
@@ -240,15 +373,27 @@ class ExLlamaV2ForkGeneratorAsync:
                 num_speculative_tokens=mtp_window,
             )
 
+        # Multi-batch (MP + MTP only): one cache row (slot) per concurrent job, batched
+        # graphed verify rounds, per-slot prompt cache. max_batch == 1 keeps the verified
+        # sequential path below untouched.
+        self.max_batch = int(max_batch) if (self.mp and mtp_drafter is not None) else 1
+
         # Shim for container access patterns (generator.generator.*)
         self.generator = self
-        self.max_batch_size = 1
+        self.max_batch_size = self.max_batch
         self.current_loras = []
         self.speculative_ngram = False
 
         self._loop = asyncio.get_running_loop()
         self._queue: asyncio.Queue = asyncio.Queue()
-        self._worker = asyncio.create_task(self._run())
+        self._prefilling_job = None
+        if self.max_batch > 1:
+            import queue as _thread_queue
+            self._bq = _thread_queue.Queue()
+            self._batch_slots = [_Slot() for _ in range(self.max_batch)]
+            self._worker = asyncio.create_task(self._run_batch())
+        else:
+            self._worker = asyncio.create_task(self._run())
         self._closed = False
 
     def set_loras(self, loras: list):
@@ -257,7 +402,10 @@ class ExLlamaV2ForkGeneratorAsync:
         self.current_loras = loras
 
     def enqueue(self, job: "ExLlamaV2ForkJobAsync"):
-        self._queue.put_nowait(job)
+        if self.max_batch > 1:
+            self._bq.put_nowait(job)
+        else:
+            self._queue.put_nowait(job)
 
     async def _run(self):
         while True:
@@ -271,6 +419,17 @@ class ExLlamaV2ForkGeneratorAsync:
                     await job.put_result(e)
             self._queue.task_done()
 
+    async def _run_batch(self):
+        try:
+            await asyncio.to_thread(self._batch_scheduler)
+        except Exception as e:
+            xlogger.error(f"Fork batch scheduler crashed: {e}")
+            # Surface the failure to every live job instead of hanging their streams.
+            for slot in self._batch_slots:
+                if slot.job is not None and not slot.job.cancelled:
+                    slot.job.queue.put_nowait(e)
+            raise
+
     async def close(self):
         if self._closed:
             return
@@ -280,13 +439,25 @@ class ExLlamaV2ForkGeneratorAsync:
         job = getattr(self, "_current_job", None)
         if job is not None:
             self._signal_abort(job)
-        while not self._queue.empty():
-            queued = self._queue.get_nowait()
-            if queued is not None and not queued.cancelled:
-                await queued.cancel()
-            self._queue.task_done()
-
-        await self._queue.put(None)
+        if self.max_batch > 1:
+            for slot in self._batch_slots:
+                if slot.job is not None:
+                    self._signal_abort(slot.job)
+            while not self._bq.empty():
+                try:
+                    queued = self._bq.get_nowait()
+                except Exception:
+                    break
+                if queued is not None and not queued.cancelled:
+                    await queued.cancel()
+            self._bq.put(None)
+        else:
+            while not self._queue.empty():
+                queued = self._queue.get_nowait()
+                if queued is not None and not queued.cancelled:
+                    await queued.cancel()
+                self._queue.task_done()
+            await self._queue.put(None)
         try:
             await self._worker
         except asyncio.CancelledError:
@@ -302,12 +473,18 @@ class ExLlamaV2ForkGeneratorAsync:
         """Set BOTH abort signals: the job-level event (checked per emitted token) and
         the MP prefill flag (checked per prefill chunk on every rank). Without the
         latter, a disconnected 80k prompt keeps prefilling for minutes after the
-        request is gone -- the token loop never runs until prefill finishes."""
+        request is gone -- the token loop never runs until prefill finishes.
+
+        Multi-batch: the prefill flag is GLOBAL (one collective abort per chunk), so it
+        is set only for the job currently prefilling. Other jobs' aborts are handled at
+        the next round boundary via their job-level event -- setting the global flag
+        for them would kill an unrelated job's in-flight prefill."""
         job.abort_event.set()
         pg = getattr(self, "tp_group", None)
         af = getattr(pg, "abort_flag", None)
         if af is not None:
-            af.set()
+            if self.max_batch <= 1 or getattr(self, "_prefilling_job", None) is job:
+                af.set()
 
     def _run_job(self, job):
         self._current_job = job
@@ -340,13 +517,23 @@ class ExLlamaV2ForkGeneratorAsync:
         if hasattr(cache, "window_beg"):
             cache.window_beg = 0
 
-    def _run_job_streaming(self, job):
-        g = self.streaming
+    def _run_job_streaming(self, job, streaming=None, row=None):
+        g = streaming if streaming is not None else self.streaming
         settings = job.gen_settings
 
         g.speculative_ngram = self.speculative_ngram and self.mtp_drafter is None
         g.sequence_ids = None
-        if self.mp:
+        if row is not None:
+            # Batch-mode plain solo run: reset ONLY this slot's row (other slots keep
+            # their live K/V). The plain path does not maintain the append-only
+            # snapshot, so the slot's lineage is invalidated.
+            self.tp_group.mtp_reset_row(row)
+            self._batch_slots[row].cache_valid = False
+            depth = self.tp_group.cache.max_seq_len
+            cap = max(0, depth - job.input_ids.shape[-1] - 1)
+            if job.max_new_tokens > cap:
+                job.max_new_tokens = cap
+        elif self.mp:
             # Full distributed reset (current_seq_len + window_beg on every rank,
             # plus stale MTP gather buffers) -- invalidates the MP MTP prompt cache
             self.tp_group.mtp_reset_cache()
@@ -358,6 +545,7 @@ class ExLlamaV2ForkGeneratorAsync:
         stop_strings = [t for t in job.stop_conditions if isinstance(t, str)]
 
         time_start = time.perf_counter()
+        self._prefilling_job = job
         g.begin_stream_ex(
             job.input_ids,
             settings,
@@ -372,6 +560,7 @@ class ExLlamaV2ForkGeneratorAsync:
             filters=job.filters,
             filter_prefer_eos=job.filter_prefer_eos,
         )
+        self._prefilling_job = None
         time_prefill = time.perf_counter() - time_start
 
         new_tokens = 0
@@ -681,6 +870,379 @@ class ExLlamaV2ForkGeneratorAsync:
             extra_text=flush,
         )
 
+    # ------------------------------------------------------------------ multi-batch scheduler
+
+    def _batch_scheduler(self):
+        """
+        Slot-based concurrency for MP + MTP (max_batch > 1).
+
+        Phases: admit pending jobs into free cache rows (serialized chunked prefill,
+        with decode rounds interleaved between chunks so active jobs stall at most one
+        chunk), then shared batched MTP rounds until every active job finishes or new
+        work arrives. Plain (filters/banned-strings) jobs run solo between batches:
+        admission stops, the active batch drains, the plain job runs on its own row
+        through the verified streaming path, then batching resumes.
+
+        Prompt-cache isolation: each slot keeps its OWN lineage (ids + position + ring
+        snapshot). A job reuses a slot's K/V only if its prompt strictly extends that
+        slot's lineage (or restores its prompt boundary); anything else resets the row.
+        Cache rows are physically separate batch rows, so slots never share K/V.
+        """
+        import queue as _thread_queue
+        from exllamav2.mtp_mp import MTPMPBatchDriver
+
+        pg = self.tp_group
+        driver = MTPMPBatchDriver(pg, self.mtp_drafter, window=self.mtp_window)
+        slots = self._batch_slots
+        pending = []
+        shutdown = False
+
+        while not shutdown:
+            if not pending and not any(s.active for s in slots):
+                item = self._bq.get()
+                if item is None:
+                    break
+                pending.append(item)
+            while True:
+                try:
+                    item = self._bq.get_nowait()
+                except _thread_queue.Empty:
+                    break
+                if item is None:
+                    shutdown = True
+                    break
+                pending.append(item)
+            pending = [j for j in pending if not j.cancelled]
+            if shutdown:
+                break
+            for j in pending:
+                if not hasattr(j, "_fork_eligible"):
+                    j._fork_eligible = self._mp_mtp_eligible(j)
+
+            plain = [j for j in pending if not j._fork_eligible]
+            if plain:
+                while any(s.active for s in slots):
+                    self._batch_decode_round_safe(slots, driver)
+                for j in plain:
+                    pending.remove(j)
+                    if j.cancelled:
+                        continue
+                    r = next(i for i, s in enumerate(slots) if not s.active)
+                    g = ExLlamaV2StreamingGenerator(
+                        _MPModelAdapterRow(pg, r), _MPCacheProxyRow(pg, r),
+                        self.tokenizer,
+                    )
+                    try:
+                        self._run_job_streaming(j, streaming=g, row=r)
+                    except Exception as e:
+                        self._put(j, e)
+                continue
+
+            for j in [j for j in pending if j._fork_eligible]:
+                free = [i for i, s in enumerate(slots) if not s.active]
+                if not free:
+                    break
+                r = self._choose_slot(slots, free, j)
+                pending.remove(j)
+                if j.cancelled:
+                    continue
+                try:
+                    self._admit_job(j, slots[r], r, driver, slots)
+                except Exception as e:
+                    slots[r].active = False
+                    slots[r].job = None
+                    slots[r].cache_valid = False
+                    self._put(j, e)
+
+            while any(s.active for s in slots):
+                self._batch_decode_round_safe(slots, driver)
+                if pending or shutdown:
+                    break
+                try:
+                    item = self._bq.get_nowait()
+                except _thread_queue.Empty:
+                    continue
+                if item is None:
+                    shutdown = True
+                    break
+                pending.append(item)
+                break
+
+        for i, s in enumerate(slots):
+            if s.active:
+                self._finish_slot(slots, i, driver, "abort")
+        for j in pending:
+            if not j.cancelled:
+                j.cancelled = True
+                self._loop.call_soon_threadsafe(j.queue.put_nowait, {
+                    "stage": "streaming",
+                    "identifier": j.identifier,
+                    "text": "",
+                    "token_ids": torch.empty((1, 0), dtype=torch.long),
+                    "eos": True,
+                    "eos_reason": "cancelled",
+                })
+
+    def _batch_decode_round_safe(self, slots, driver):
+        try:
+            self._batch_decode_round(slots, driver)
+        except Exception as e:
+            # A failed round (worker crash, CUDA error) must surface to every live job
+            # instead of hanging their streams; invalidate the affected slots.
+            for i, s in enumerate(slots):
+                if s.active:
+                    s.active = False
+                    s.cache_valid = False
+                    job, s.job = s.job, None
+                    s.state = None
+                    if job is not None and not job.cancelled:
+                        self._put(job, e)
+            raise
+
+    def _choose_slot(self, slots, free, job):
+        """Prefix affinity: prefer the free slot whose cached lineage shares the longest
+        prefix with the job's prompt (chat continuations land on their own slot). Any
+        free slot is correct -- _admit_job reuses or resets based on the exact check."""
+        best, best_len = free[0], -1
+        ids = job.input_ids
+        for i in free:
+            s = slots[i]
+            if not s.cache_valid or s.cached_ids is None:
+                continue
+            m = min(s.cached_ids.shape[-1], ids.shape[-1])
+            if m > 0 and torch.equal(s.cached_ids[:, :m], ids[:, :m]):
+                if m > best_len:
+                    best, best_len = i, m
+        return best
+
+    def _admit_job(self, job, slot, r, driver, slots):
+        """Prompt-cache decision + chunked prefill into row r, then arm the MTP row.
+        Decode rounds for already-active slots interleave between prefill chunks."""
+        pg = self.tp_group
+        ids_cpu = job.input_ids.cpu()
+        n_prompt = ids_cpu.shape[-1]
+        cached = slot.cached_ids if slot.cache_valid else None
+        reuse = False
+        restored = False
+        prefill_ids = ids_cpu
+        start = 0
+        if cached is not None:
+            clen = cached.shape[-1]
+            m = min(clen, n_prompt)
+            prefix_ok = torch.equal(ids_cpu[:, :m], cached[:, :m])
+            cpos = slot.cached_pos
+            overshoot = cpos - clen
+            start = min(cpos, clen)
+            if (prefix_ok and m == clen and n_prompt > start
+                    and -1 <= overshoot <= 8 and clen >= pg.cache.window_begs[r]):
+                reuse = True
+                if cpos > clen:
+                    pg.mtp_set_seq_len_row(r, clen)
+                prefill_ids = ids_cpu[:, start:]
+                xlogger.info(
+                    f"MP MTP prompt cache hit (slot {r}): reusing {start} tokens, "
+                    f"prefilling {n_prompt - start} new"
+                )
+            elif (slot.prompt_boundary > 0
+                    and n_prompt > slot.prompt_boundary
+                    and slot.prompt_boundary <= clen
+                    and torch.equal(ids_cpu[:, :slot.prompt_boundary],
+                                    cached[:, :slot.prompt_boundary])
+                    and pg.restore_prompt_ring_row(r, slot.prompt_boundary)):
+                restored = True
+                start = slot.prompt_boundary
+                prefill_ids = ids_cpu[:, slot.prompt_boundary:]
+                xlogger.info(
+                    f"MP MTP prompt cache restore (slot {r}): rewound to prompt "
+                    f"boundary {slot.prompt_boundary}, prefilling "
+                    f"{n_prompt - slot.prompt_boundary} re-rendered/new tokens"
+                )
+            else:
+                if prefix_ok:
+                    why = (f"cache overshoot {overshoot} outside [-1, 8]"
+                           if not (-1 <= overshoot <= 8)
+                           else "prompt does not extend the cached sequence")
+                else:
+                    diff = (ids_cpu[0, :m] != cached[0, :m]).nonzero()
+                    at = int(diff[0]) if diff.numel() else m
+                    why = f"history diverges at token {at} (re-rendered/edited prompt?)"
+                xlogger.info(f"MP MTP prompt cache miss (slot {r}): {why}; full re-prefill")
+        if not reuse and not restored:
+            pg.mtp_reset_row(r)
+            start = 0
+        slot.cached_tokens = start
+        slot.job = job
+
+        time_start = time.perf_counter()
+        pg.abort_flag.clear()
+        self._prefilling_job = job
+        chunk_size = max(256, pg.config.max_input_len)
+        n = prefill_ids.shape[-1]
+        pos = 0
+        logits = state = None
+        aborted = False
+        if n > chunk_size:
+            xlogger.info(
+                f"MP batch prefill slot {r}: {n} tokens in {chunk_size}-token chunks "
+                f"(the per-chunk [prefill] trace resets its denominator each call; "
+                f"this counter is the cumulative progress)"
+            )
+        try:
+            while pos < n:
+                if job.abort_event.is_set():
+                    aborted = True
+                    break
+                end = min(pos + chunk_size, n)
+                if end == n:
+                    logits, state = pg.forward_state_row(
+                        r, prefill_ids[:, pos:end], last_id_only=True)
+                else:
+                    pg.forward_row(r, prefill_ids[:, pos:end],
+                                   last_id_only=True, preprocess_only=True)
+                pos = end
+                if n > chunk_size:
+                    xlogger.info(f"MP batch prefill slot {r}: {pos}/{n} ({100 * pos // n}%)")
+                if job.abort_event.is_set():
+                    aborted = True
+                    break
+                # Keep active jobs decoding during long prefills: stall <= one chunk.
+                if any(s.active for s in slots):
+                    self._batch_decode_round_safe(slots, driver)
+        finally:
+            self._prefilling_job = None
+            pg.abort_flag.clear()
+        time_prefill = time.perf_counter() - time_start
+
+        if aborted or logits is None:
+            slot.cache_valid = False
+            slot.job = None
+            self._finish(job, "abort", 0, "", time_start, time_prefill, time_start)
+            return
+
+        # Bound generation by cache depth. A verify round writes W extra rows past the
+        # current position and kv_write silently drops rows beyond the buffer; an explicit
+        # client max_tokens larger than the remaining depth would push seq_lens past
+        # max_seq_len, desyncing the incremental gather (worker clamps, parent doesn't).
+        # The container bounds prompt length but passes max_tokens through uncapped.
+        depth = pg.cache.max_seq_len
+        cap = max(0, depth - n_prompt - self.mtp_window)
+        if job.max_new_tokens > cap:
+            xlogger.info(
+                f"MP batch slot {r}: capping max_new_tokens {job.max_new_tokens} -> "
+                f"{cap} (cache depth {depth}, prompt {n_prompt}, verify headroom "
+                f"{self.mtp_window})"
+            )
+            job.max_new_tokens = cap
+
+        pg.snapshot_prompt_ring_row(r)
+        slot.prompt_boundary = n_prompt
+
+        st = _BatchJobState(job, time_start, time_prefill)
+        slot.state = st
+        ban = list(st.stop_tokens) if job.min_new_tokens > 0 else None
+        driver.begin_row(r, job.input_ids, logits, state,
+                         settings=job.gen_settings, tokenizer=self.tokenizer,
+                         seq_ids=st.seq_ids, ban_tokens=ban)
+        slot.active = True
+
+    def _batch_decode_round(self, slots, driver):
+        for i, s in enumerate(slots):
+            if s.active and s.job.abort_event.is_set():
+                flush = s.state.pending_text(self.tokenizer)
+                self._finish_slot(slots, i, driver, "abort", extra_text=flush)
+        # Depth guard (belt-and-suspenders over the admission cap): a round at position
+        # pos writes through pos-1+W, so pos+W must stay inside the cache. Covers any
+        # path that moves a row's position outside the driver (restore/recommit).
+        depth = self.tp_group.cache.max_seq_len
+        for i, s in enumerate(slots):
+            if s.active and self.tp_group.cache.seq_lens[i] + self.mtp_window > depth:
+                flush = s.state.pending_text(self.tokenizer)
+                self._finish_slot(slots, i, driver, "max_new_tokens", extra_text=flush)
+        active = [i for i, s in enumerate(slots) if s.active]
+        if not active:
+            return
+        settings_map = {i: slots[i].job.gen_settings for i in active}
+        seq_ids_map = {i: slots[i].state.seq_ids for i in active}
+        ban_map = {
+            i: (list(slots[i].state.stop_tokens)
+                if slots[i].state.new_tokens < slots[i].job.min_new_tokens else None)
+            for i in active
+        }
+        toks = driver.step_batch(active, settings_map, self.tokenizer,
+                                 seq_ids_map, ban_map)
+        for i in active:
+            if i in toks and slots[i].active:
+                self._consume_token(slots, i, driver, toks[i])
+
+    def _consume_token(self, slots, r, driver, tok):
+        """One emitted token for slot r -- the sequential MTP token loop body, scoped
+        to the job's own state (stop conditions, text matching, streaming chunks)."""
+        slot = slots[r]
+        job = slot.job
+        st = slot.state
+        st.all_ids.append(tok)
+        st.new_tokens += 1
+        st.seq_ids = torch.cat(
+            [st.seq_ids, torch.tensor([[tok]], dtype=torch.long)], dim=-1)
+
+        if tok in st.stop_tokens:
+            if st.new_tokens > job.min_new_tokens:
+                flush = st.pending_text(self.tokenizer)
+                self._finish_slot(slots, r, driver, "stop_token",
+                                  stop_token=tok, extra_text=flush)
+                return
+            # Below min_new_tokens: consume but don't emit the stop token.
+        else:
+            st.gen_ids.append(tok)
+            full = st.decode_full(self.tokenizer)
+            if full.startswith(st.emitted):
+                emit_text, matched, hold = st.matcher.feed(full[len(st.emitted):])
+                if matched is not None:
+                    self._finish_slot(slots, r, driver, "stop_string",
+                                      stop_string=matched, extra_text=emit_text)
+                    return
+                if not hold and emit_text:
+                    st.emitted += emit_text
+                    self._put(job, {
+                        "stage": "streaming",
+                        "identifier": job.identifier,
+                        "text": emit_text,
+                        "token_ids": torch.tensor([[tok]], dtype=torch.long),
+                        "eos": False,
+                    })
+
+        if st.new_tokens >= job.max_new_tokens:
+            flush = st.pending_text(self.tokenizer)
+            self._finish_slot(slots, r, driver, "max_new_tokens", extra_text=flush)
+
+    def _finish_slot(self, slots, r, driver, reason, stop_token=None,
+                     stop_string=None, extra_text=""):
+        slot = slots[r]
+        job = slot.job
+        st = slot.state
+        driver.finish_row(r)
+        # Record the slot's lineage: prompt + every consumed token + live cache
+        # position. The next job admitted to this slot reuses it only on a strict
+        # prefix extension (or prompt-boundary restore); otherwise the row resets.
+        ids_cpu = job.input_ids.cpu()
+        if st.all_ids:
+            full = torch.cat(
+                [ids_cpu, torch.tensor([st.all_ids], dtype=torch.long)], dim=-1)
+        else:
+            full = ids_cpu
+        slot.cached_ids = full.contiguous()
+        slot.cached_pos = self.tp_group.cache.seq_lens[r]
+        slot.cache_valid = True
+        slot.active = False
+        slot.job = None
+        slot.state = None
+        self._finish(
+            job, reason, st.new_tokens, st.emitted + extra_text,
+            st.time_start, st.time_prefill, st.time_gen_start,
+            stop_token=stop_token, stop_string=stop_string,
+            extra_text=extra_text, cached_tokens=slot.cached_tokens,
+        )
+
     def _finish(
         self,
         job,
@@ -694,6 +1256,7 @@ class ExLlamaV2ForkGeneratorAsync:
         stop_string: Optional[str] = None,
         extra_text: str = "",
         extra_ids: Optional[torch.Tensor] = None,
+        cached_tokens: int = 0,
     ):
         result = {
             "stage": "streaming",
@@ -705,7 +1268,7 @@ class ExLlamaV2ForkGeneratorAsync:
             "full_completion": full_text,
             "new_tokens": new_tokens,
             "prompt_tokens": job.input_ids.shape[-1],
-            "cached_tokens": 0,
+            "cached_tokens": cached_tokens,
             "time_enqueued": time_start - job.time_enqueue,
             "time_prefill": time_prefill,
             "time_generate": time.perf_counter() - time_gen_start,

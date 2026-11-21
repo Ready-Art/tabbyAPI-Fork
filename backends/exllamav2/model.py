@@ -406,10 +406,23 @@ class ExllamaV2Container(BaseModelContainer):
         # Set max batch size to the config override
         self.max_batch_size = unwrap(kwargs.get("max_batch_size"))
         if self.fork_mode:
-            # The fork TP/MTP paths own a single cache: one job at a time
-            if self.max_batch_size is None or self.max_batch_size > 1:
-                xlogger.info("Fork TP/MTP mode: limiting max_batch_size to 1.")
-            self.max_batch_size = 1
+            if self.tp_backend == "mp" and self.use_mtp:
+                # MP + MTP supports slot-based multi-batch: one cache row per concurrent
+                # job, batched graphed verify rounds, per-slot prompt cache. VRAM scales
+                # linearly (KV cache + MTP shadow per row), so the default stays 1 and
+                # the user opts in via max_batch_size.
+                self.max_batch_size = max(1, int(self.max_batch_size or 1))
+                if self.max_batch_size > 1:
+                    xlogger.info(
+                        f"Fork MP+MTP mode: multi-batch enabled (max_batch_size="
+                        f"{self.max_batch_size}). KV cache and MTP shadow VRAM scale "
+                        f"per concurrent slot."
+                    )
+            else:
+                # SP / non-MTP fork paths own a single cache: one job at a time
+                if self.max_batch_size is None or self.max_batch_size > 1:
+                    xlogger.info("Fork TP/MTP mode: limiting max_batch_size to 1.")
+                self.max_batch_size = 1
 
         # Check whether the user's configuration supports flash/paged attention
         # Also check if exl2 has disabled flash attention
@@ -854,6 +867,7 @@ class ExllamaV2Container(BaseModelContainer):
                 max_seq_len=self.config.max_seq_len,
                 cache_tokens=self.cache_size,
                 cache_base_name="ExLlamaV2Cache_SWA" if self.is_swa else "ExLlamaV2Cache",
+                max_batch=self.max_batch_size if self.use_mtp else 1,
             )
             self.tp_group.start()
             self.model = self.tp_group.model
@@ -1004,6 +1018,7 @@ class ExllamaV2Container(BaseModelContainer):
                     tp_group=self.tp_group,
                     mtp_drafter=self.mtp_drafter,
                     mtp_window=self.mtp_window,
+                    max_batch=self.max_batch_size,
                 )
             else:
                 self.generator = ExLlamaV2DynamicGeneratorAsync(

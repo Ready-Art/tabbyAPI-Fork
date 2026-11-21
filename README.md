@@ -189,7 +189,8 @@ back to NCCL automatically if unavailable). Then point any OpenAI-compatible cli
 `chat_template_kwargs: {"enable_thinking": true}` or `reasoning_effort`
 (`none`/`minimal` off, `low`/`medium`/`high` on).
 
-Notes and limitations (batch size 1 on the fork TP/MTP paths, full-sampler MTP on both SP and MP,
+Notes and limitations (batch size 1 by default on the fork TP/MTP paths — **experimental
+multi-batch** opt-in via `max_batch_size` on MP + MTP, full-sampler MTP on both SP and MP,
 no LoRAs on MP, CUDA graphs and FlashInfer knobs) are documented in
 **[docs/11.-ReadyArt-ExLlamaV2-Fork.md](docs/11.-ReadyArt-ExLlamaV2-Fork.md)**.
 
