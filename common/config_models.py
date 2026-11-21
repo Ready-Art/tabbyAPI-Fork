@@ -437,6 +437,19 @@ class DraftModelConfig(BaseConfigModel):
             "(e.g. DFlash with 15 tokens by default) shorter drafts may be preferable."
         ),
     )
+    sparse_draft_head: Optional[int] = Field(
+        0,
+        description=(
+            "Draft through a dynamic sparse LM head of this many vocabulary columns;\n"
+            "0 uses the full head (default). Cuts draft latency for the MTP and DFlash\n"
+            "drafters, which read a full-vocab head per draft step. Verification keeps\n"
+            "the full head, so output is unaffected; a probe-based miss gate falls back\n"
+            "to the full head if the subset misses too often. The column set follows\n"
+            "token frequencies seen in prompts and generations, saved per model under\n"
+            "~/.cache/exllamav2-fork/token_stats. Try 16384. ReadyArt exllamav2 fork\n"
+            "MP paths only (single-sequence); ignored by the multi-batch scheduler."
+        ),
+    )
     ngram_match_min: Optional[int] = Field(
         2,
         description=(

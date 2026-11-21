@@ -269,6 +269,9 @@ class ExllamaV2Container(BaseModelContainer):
                     # (resolved at load); 16 here is provisional headroom for
                     # max_output_len until the drafter reports its window.
                     self._draft_window_cfg = draft_args.get("draft_num_tokens")
+                    # Stashed here (create() scope): draft_args is NOT visible in
+                    # load_model_sync(), where the drafter is constructed.
+                    self._sparse_head_cfg = unwrap(draft_args.get("sparse_draft_head"), 0)
                     self.mtp_window = unwrap(
                         draft_args.get("draft_num_tokens"),
                         16 if self.use_dflash else 6,
@@ -1009,12 +1012,14 @@ class ExllamaV2Container(BaseModelContainer):
                 # MP: the drafter's target must be the process group itself so
                 # gathers / aux states go through the worker pipes.
                 drafter_target = self.tp_group if self.tp_group is not None else self.model
+                sparse_cols = getattr(self, "_sparse_head_cfg", 0)
                 if self.use_dflash:
                     self.mtp_drafter = DFlashDrafter(
                         drafter_target,
                         str(self.draft_model_dir.resolve()),
                         device=self.draft_device,
                         num_draft_tokens=self._draft_window_cfg,
+                        sparse_head_columns=sparse_cols,
                     )
                     # The checkpoint's block_size resolves the actual window.
                     self.mtp_window = self.mtp_drafter.num_draft_tokens
@@ -1025,6 +1030,7 @@ class ExllamaV2Container(BaseModelContainer):
                         str(self.draft_model_dir.resolve()),
                         device=self.draft_device,
                         num_draft_tokens=self.mtp_window,
+                        sparse_head_columns=sparse_cols,
                     )
                 if self.tp_group is not None:
                     self.tp_group.enable_mtp(self.mtp_drafter, num_draft_tokens=self.mtp_window)
