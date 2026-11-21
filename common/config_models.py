@@ -451,10 +451,13 @@ class DraftModelConfig(BaseConfigModel):
     mtp_draft_graph: Optional[bool] = Field(
         False,
         description=(
-            "Capture the MTP drafter step into a CUDA graph (default: False).\n"
+            "Capture the whole MTP draft window into one CUDA graph (default: False).\n"
             "ExllamaV2 ReadyArt fork only. Sets EXL2_MTP_DRAFT_GRAPH.\n"
-            "Experimental: eager FlashInfer drafting is the verified default; the\n"
-            "graphed path is bandwidth-bound at long context."
+            "FlashInfer paged-decode attention + a GPU-resident embedding table\n"
+            "(+2.7 GB on the draft device); draft steps chain on-device with no\n"
+            "per-step host round trips. Measured ~68 tok/s generation on\n"
+            "Gemma-4-31B-IT (4x3090 200W cap, temp 1, draft_num_tokens 3, ~1.3k ctx).\n"
+            "Eager drafting remains the fallback if capture fails."
         ),
     )
 

@@ -170,15 +170,20 @@ draft_model:
   draft_model_dir: models
   draft_mode: mtp
   draft_model_name: gemma-4-31B-it-assistant
-  draft_num_tokens: 2             # MTP verify window width
+  draft_num_tokens: 3             # MTP verify window width (3 = measured best on prose)
   draft_device: 0
 ```
 
 **Launch the server with P2P enabled** (this is how the tested rig runs it):
 
 ```bash
-NCCL_P2P_LEVEL=PXB python main.py
+NCCL_P2P_LEVEL=PXB EXL2_MTP_DRAFT_GRAPH=1 python main.py
 ```
+
+With `draft_num_tokens: 3` and the whole-window drafter graph enabled
+(`EXL2_MTP_DRAFT_GRAPH=1`), this measures **~68 tok/s generation** on Gemma-4-31B-IT at
+~1.3k context (temperature-1 sampling, 4× RTX 3090 power-limited to 200 W, `cache_size: 32768`,
+`chunk_size: 2048`, `gpu_split: [22, 22, 22, 22]`, `max_batch_size: 1`; 2026-11-21).
 
 `NCCL_P2P_LEVEL=PXB` enables PCIe peer-to-peer across the PCI switch on the tested 4× RTX 3090
 box. **The right value depends on your topology** — `PXB`/`PHB`/`SYS`/`NODE` describe how far
