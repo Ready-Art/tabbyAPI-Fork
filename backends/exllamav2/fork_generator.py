@@ -27,6 +27,7 @@ extension of the slot's own lineage -- slots never share K/V).
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 from typing import List, Optional
@@ -1068,6 +1069,52 @@ class ExLlamaV2ForkGeneratorAsync:
                     best, best_len = i, m
         return best
 
+    def _clone_source(self, slots, r, ids_cpu):
+        """Best shared-prefix K/V source among the OTHER slots for a job whose own
+        lineage did not match: (slot index, clone position) or None.
+
+        Active slots offer their prompt + emitted-so-far (conservative: the committed
+        cache can lag the emitted ids by at most the pending queue, and the clone
+        position is clamped to the committed seq_lens anyway); free slots offer their
+        recorded lineage. The position must sit inside the source's live SWA ring
+        (>= its window origin) -- a long-lived slot whose ring has shifted past the
+        shared prefix cannot serve it (SWA K/V is gone; full layers alone are not a
+        valid state). Runs between rounds, so an active source's prefix is stable."""
+        if os.environ.get("EXL2_BATCH_KV_CLONE", "1") == "0":
+            return None
+        min_len = int(os.environ.get("EXL2_BATCH_CLONE_MIN", "512"))
+        n = ids_cpu.shape[-1]
+        cache = self.tp_group.cache
+        best = None
+        for i, s in enumerate(slots):
+            if i == r:
+                continue
+            if s.active:
+                if s.state is None:
+                    continue
+                src_ids = s.state.seq_ids
+                pos = cache.seq_lens[i]
+            elif s.cache_valid and s.cached_ids is not None:
+                src_ids = s.cached_ids
+                pos = s.cached_pos
+            else:
+                continue
+            wb = cache.window_begs[i]
+            m = min(src_ids.shape[-1], n, pos)
+            if m < min_len or m <= wb:
+                continue
+            a, b = ids_cpu[0, :m], src_ids[0, :m]
+            if torch.equal(a, b):
+                match = m
+            else:
+                diff = (a != b).nonzero()
+                match = int(diff[0]) if diff.numel() else m
+            if match < min_len or match <= wb:
+                continue
+            if best is None or match > best[1]:
+                best = (i, match)
+        return best
+
     def _admit_job(self, job, slot, r, driver, slots):
         """Prompt-cache decision + chunked prefill into row r, then arm the MTP row.
         Decode rounds for already-active slots interleave between prefill chunks."""
@@ -1121,8 +1168,57 @@ class ExLlamaV2ForkGeneratorAsync:
                     diff = (ids_cpu[0, :m] != cached[0, :m]).nonzero()
                     at = int(diff[0]) if diff.numel() else m
                     why = f"history diverges at token {at} (re-rendered/edited prompt?)"
-                xlogger.info(f"MP MTP prompt cache miss (slot {r}): {why}; full re-prefill")
-        if not reuse and not restored:
+                xlogger.info(f"MP MTP prompt cache miss (slot {r}): {why}")
+        partial = False
+        if (not reuse and not restored and slot.cache_valid
+                and slot.cached_ids is not None
+                and os.environ.get("EXL2_BATCH_KV_CLONE", "1") != "0"):
+            # Own-lineage partial prefix: the prompt diverges from this slot's history
+            # (edited/regenerated turn, different question on the same document) but
+            # shares a long prefix with it. Rewind the slot to the divergence point and
+            # prefill only the suffix -- the slot's own K/V prefix is already exactly
+            # right, so this costs a position truncation, not copies or a re-prefill.
+            clen = slot.cached_ids.shape[-1]
+            m = min(clen, n_prompt)
+            match = 0
+            if m > 0:
+                if torch.equal(ids_cpu[:, :m], slot.cached_ids[:, :m]):
+                    match = m
+                else:
+                    diff = (ids_cpu[0, :m] != slot.cached_ids[0, :m]).nonzero()
+                    match = int(diff[0]) if diff.numel() else m
+            p = min(match, slot.cached_pos)
+            min_len = int(os.environ.get("EXL2_BATCH_CLONE_MIN", "512"))
+            if match >= min_len and 0 < p >= pg.cache.window_begs[r]:
+                pg.truncate_row(r, p)
+                start = p
+                prefill_ids = ids_cpu[:, start:]
+                partial = True
+                xlogger.info(
+                    f"MP MTP prompt cache partial reuse (slot {r}): rewound to shared "
+                    f"prefix {p}, prefilling {n_prompt - p} new"
+                )
+        cloned = False
+        if not reuse and not restored and not partial:
+            # Shared-prefix clone: concurrent requests commonly share a long system /
+            # few-shot / document prefix, and a continuation whose own slot is busy
+            # would otherwise re-prefill the whole context on a free slot. Copy the
+            # best-matching OTHER slot's committed K/V (a physical copy -- slots never
+            # share live K/V, so the isolation invariant holds) and prefill only the
+            # suffix. EXL2_BATCH_KV_CLONE=0 disables; EXL2_BATCH_CLONE_MIN sets the
+            # minimum shared prefix (tokens) worth cloning.
+            src = self._clone_source(slots, r, ids_cpu)
+            if src is not None:
+                i, p = src
+                pg.clone_row(i, r, p)
+                start = p
+                prefill_ids = ids_cpu[:, start:]
+                cloned = True
+                xlogger.info(
+                    f"MP MTP prompt cache clone (slot {r} <- slot {i}): reusing {p} "
+                    f"shared-prefix tokens, prefilling {n_prompt - p} new"
+                )
+        if not reuse and not restored and not partial and not cloned:
             pg.mtp_reset_row(r)
             start = 0
         slot.cached_tokens = start
@@ -1225,9 +1321,14 @@ class ExLlamaV2ForkGeneratorAsync:
         }
         toks = driver.step_batch(active, settings_map, self.tokenizer,
                                  seq_ids_map, ban_map)
+        # Bursts (m_acc+1 tokens per refreshed row): consume in order; a stop/max
+        # finish mid-burst deactivates the slot and discards the tail (the same
+        # truncation the old one-token loop applied at round boundaries).
         for i in active:
-            if i in toks and slots[i].active:
-                self._consume_token(slots, i, driver, toks[i])
+            for tok in toks.get(i, ()):
+                if not slots[i].active:
+                    break
+                self._consume_token(slots, i, driver, tok)
 
     def _consume_token(self, slots, r, driver, tok):
         """One emitted token for slot r -- the sequential MTP token loop body, scoped
