@@ -170,6 +170,19 @@ model:
   # can reduce it further to minimize VRAM overhead.
   max_batch_size:
 
+  # Offload idle prompt-cache lineages to host RAM (default: false). EXPERIMENTAL.
+  # ExllamaV2 ReadyArt fork only: mp backend + MTP drafting (batch 1 and multi-batch).
+  # VRAM rows keep the hot conversations; the oldest/least-used idle lineage is
+  # copied to RAM when a new job needs its row, and a later request matching it
+  # restores the K/V + MTP draft shadow in milliseconds instead of re-prefilling.
+  # Ignored for DFlash drafting. The cache never allocates extra VRAM.
+  prompt_cache_offload: false
+
+  # Host RAM cap for offloaded prompt-cache lineages, in MB (default: 8192).
+  # Only used when prompt_cache_offload is true. Oldest/least-used entries are
+  # evicted first when the cap is reached; the budget is never exceeded.
+  prompt_cache_ram_limit_mb: 8192
+
   # Set the prompt template for this model. (default: None)
   # If empty, attempts to look for the model's chat template.
   # If a model contains multiple templates in its tokenizer_config.json,

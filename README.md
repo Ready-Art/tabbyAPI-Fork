@@ -196,7 +196,10 @@ back to NCCL automatically if unavailable). Then point any OpenAI-compatible cli
 
 Notes and limitations (batch size 1 by default on the fork TP/MTP paths — **experimental
 multi-batch** opt-in via `max_batch_size` on MP + MTP, validated under concurrent load at
-`max_batch_size: 4` with per-slot prompt caching and shared-prefix KV cloning; full-sampler
+`max_batch_size: 4` with per-slot prompt caching and shared-prefix KV cloning; **experimental
+prompt-cache RAM offload** opt-in via `prompt_cache_offload` + `prompt_cache_ram_limit_mb`,
+tiering idle conversations to host RAM under a **whole-server** byte cap so the VRAM context
+budget is not a hard limit on cached conversations when sharing the API; full-sampler
 MTP on both SP and MP, no LoRAs on MP, CUDA graphs and FlashInfer knobs) are documented in
 **[docs/11.-ReadyArt-ExLlamaV2-Fork.md](docs/11.-ReadyArt-ExLlamaV2-Fork.md)**.
 

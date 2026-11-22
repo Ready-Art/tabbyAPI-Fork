@@ -111,6 +111,8 @@ class ExllamaV2Container(BaseModelContainer):
     cache_mode: str = "FP16"
     draft_cache_mode: str = "FP16"
     max_batch_size: Optional[int] = None
+    prompt_cache_offload: bool = False
+    prompt_cache_ram_limit_mb: int = 8192
 
     # GPU split vars
     gpu_split: List[float] = []
@@ -488,6 +490,26 @@ class ExllamaV2Container(BaseModelContainer):
                 if self.max_batch_size is None or self.max_batch_size > 1:
                     xlogger.info("Fork TP/MTP mode: limiting max_batch_size to 1.")
                 self.max_batch_size = 1
+
+        # Prompt-cache RAM offload (opt-in, EXPERIMENTAL): idle lineages tier to
+        # host RAM under a byte cap instead of being discarded when a cache row
+        # is reused. MP + MTP only (the shadow/snapshot mechanics ride the MTP
+        # gather protocol); DFlash keeps its own draft KV and is not supported.
+        self.prompt_cache_offload = unwrap(kwargs.get("prompt_cache_offload"), False)
+        self.prompt_cache_ram_limit_mb = unwrap(kwargs.get("prompt_cache_ram_limit_mb"), 8192)
+        if self.prompt_cache_offload:
+            if not (self.tp_backend == "mp" and self.use_mtp and not self.use_dflash):
+                xlogger.warning(
+                    "prompt_cache_offload requires the mp tensor-parallel backend "
+                    "with MTP drafting (DFlash is not supported). Disabling offload."
+                )
+                self.prompt_cache_offload = False
+            else:
+                xlogger.info(
+                    f"Fork MP+MTP: prompt-cache RAM offload enabled "
+                    f"(cap {self.prompt_cache_ram_limit_mb} MB, oldest/least-used "
+                    f"lineages evicted first)."
+                )
 
         # Check whether the user's configuration supports flash/paged attention
         # Also check if exl2 has disabled flash attention
@@ -1106,6 +1128,8 @@ class ExllamaV2Container(BaseModelContainer):
                     mtp_drafter=self.mtp_drafter,
                     mtp_window=self.mtp_window,
                     max_batch=self.max_batch_size,
+                    prompt_cache_offload=self.prompt_cache_offload,
+                    prompt_cache_ram_limit_mb=self.prompt_cache_ram_limit_mb,
                 )
             else:
                 self.generator = ExLlamaV2DynamicGeneratorAsync(

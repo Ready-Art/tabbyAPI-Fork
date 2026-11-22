@@ -278,6 +278,142 @@ class _MPCacheProxyRow:
         return getattr(self._pg.cache.row_view(self._row), name)
 
 
+def _prefix_match_len(ids_cpu, cached, m):
+    """Length of the shared token prefix of two (1, n) id tensors, capped at m."""
+    if m <= 0:
+        return 0
+    if torch.equal(ids_cpu[:, :m], cached[:, :m]):
+        return m
+    diff = (ids_cpu[0, :m] != cached[0, :m]).nonzero()
+    return int(diff[0]) if diff.numel() else m
+
+
+class _ColdPromptStore:
+    """Host-RAM tier of the MP+MTP prompt cache (opt-in, EXPERIMENTAL).
+
+    The VRAM tier is the scheduler's preallocated cache rows (max_batch lineages).
+    This store extends lineage capacity beyond the rows: when an idle slot's row is
+    needed by a new job, its lineage is offloaded here (per-rank K/V slices stay
+    rank-local; the MTP draft shadow + prompt-boundary ring snapshot travel with it)
+    instead of being discarded. A later request matching a cold lineage restores it
+    into a free row in milliseconds -- no re-prefill of the shared context.
+
+    Budget: a hard byte cap (prompt_cache_ram_limit_mb). Before every offload the
+    coldest entries (oldest last_used, then fewest hits) are dropped until the new
+    one fits; an entry larger than the whole cap is skipped. Nothing here allocates
+    VRAM, and every failure degrades to a full re-prefill -- never a failed job."""
+
+    def __init__(self, pg, cap_mb):
+        self.pg = pg
+        self.cap = int(cap_mb) * 2**20
+        self.entries = {}
+        self.total = 0
+        self.n_offload = 0
+        self.n_restore = 0
+        self.n_evict = 0
+
+    def match(self, ids_cpu, min_len):
+        """Best restorable prefix among cold lineages: (record, match_len, p) or
+        None. p = min(match, committed pos) must reach into the lineage's live SWA
+        ring (> its window origin) -- the same validity rule as cross-slot clones."""
+        n = ids_cpu.shape[-1]
+        best = None
+        for rec in self.entries.values():
+            m = min(rec["ids"].shape[-1], n, rec["pos"])
+            if m < min_len:
+                continue
+            match = _prefix_match_len(ids_cpu, rec["ids"], m)
+            if match < min_len:
+                continue
+            p = min(match, rec["pos"])
+            # Restorable if the shared prefix reaches into the FINAL live ring
+            # (p > wb), OR -- when generation shifted the ring past the divergence
+            # (long conversations) -- the prompt-boundary snapshot can rewind the ring
+            # to an origin at/below the shared prefix (match >= snap_wb). The snapshot
+            # is what makes a cold thought-stripped continuation of a LONG chat restore
+            # its document instead of re-prefilling it.
+            snap_ok = (rec["snap_wb"] is not None and rec["prompt_boundary"] > 0
+                       and match >= rec["snap_wb"])
+            if p <= rec["wb"] and not snap_ok:
+                continue
+            if best is None or match > best[1]:
+                best = (rec, match, p)
+        return best
+
+    def put(self, bundle, ids, pos, wb, prompt_boundary):
+        """Store a successful offload bundle, evicting coldest entries to fit the
+        cap. Returns the record, or None when skipped (entry alone exceeds cap)."""
+        size = bundle["bytes"]
+        if size > self.cap:
+            self.pg.drop_offload_bundle(bundle)
+            xlogger.info(
+                f"[prompt-offload] skip: lineage {size / 2**20:.0f} MB exceeds the "
+                f"RAM cap ({self.cap / 2**20:.0f} MB)"
+            )
+            return None
+        while self.total + size > self.cap and self.entries:
+            self._evict_coldest("RAM cap")
+        eid = bundle["entry_id"]
+        # The boundary snapshot's ring origin (None when the lineage had no snapshot):
+        # match() uses it to accept long-conversation lineages whose final ring shifted
+        # past the shared prefix but whose snapshot can still rewind to it.
+        local_snap = bundle.get("local_snap")
+        snap_wb = local_snap[1] if local_snap is not None else None
+        rec = {
+            "id": eid, "bundle": bundle, "ids": ids, "pos": pos, "wb": wb,
+            "prompt_boundary": prompt_boundary, "snap_wb": snap_wb,
+            "last_used": time.monotonic(), "hits": 0, "bytes": size,
+        }
+        self.entries[eid] = rec
+        self.total += size
+        self.n_offload += 1
+        return rec
+
+    def _evict_coldest(self, reason):
+        eid = min(self.entries,
+                  key=lambda k: (self.entries[k]["last_used"], self.entries[k]["hits"]))
+        self.drop(eid, reason)
+
+    def drop(self, eid, reason=""):
+        rec = self.entries.pop(eid, None)
+        if rec is None:
+            return
+        self.total -= rec["bytes"]
+        try:
+            self.pg.drop_offload_bundle(rec["bundle"])
+        except Exception:
+            pass
+        self.n_evict += 1
+        xlogger.info(
+            f"[prompt-offload] evict cold lineage {str(eid)[:8]} "
+            f"({rec['pos']} tok, {rec['bytes'] / 2**20:.0f} MB)"
+            f"{': ' + reason if reason else ''}; store "
+            f"{self.total / 2**20:.0f}/{self.cap / 2**20:.0f} MB, "
+            f"{len(self.entries)} entries"
+        )
+
+    def consume(self, eid):
+        """Remove a record whose lineage was FULLY restored into a VRAM row: the
+        row owns the K/V again and the ring snapshot was re-attached, so the cold
+        copies (worker storage + parent tensors) are freed."""
+        rec = self.entries.pop(eid, None)
+        if rec is None:
+            return
+        self.total -= rec["bytes"]
+        try:
+            self.pg.drop_offload_bundle(rec["bundle"])
+        except Exception:
+            pass
+
+    def touch(self, rec):
+        rec["last_used"] = time.monotonic()
+        rec["hits"] += 1
+
+    def clear(self):
+        for eid in list(self.entries):
+            self.drop(eid)
+
+
 class _Slot:
     """One cache row of the multi-batch scheduler: the live job (if any) plus the
     slot's append-only prompt-cache lineage. The lineage survives job completion so
@@ -293,6 +429,10 @@ class _Slot:
         self.cache_valid = False
         self.prompt_boundary = 0
         self.cached_tokens = 0
+        # RAM-offload tiering stats: which idle lineage to evict first when a new
+        # job needs the row (oldest / least-used). Unused when offload is disabled.
+        self.last_used = 0.0
+        self.hits = 0
 
 
 class _BatchJobState:
@@ -342,6 +482,8 @@ class ExLlamaV2ForkGeneratorAsync:
         mtp_drafter=None,
         mtp_window: int = 6,
         max_batch: int = 1,
+        prompt_cache_offload: bool = False,
+        prompt_cache_ram_limit_mb: int = 8192,
     ):
         self.tokenizer = tokenizer
         # Append-only prompt cache (MP MTP): token ids whose K/V is live in the cache.
@@ -378,6 +520,27 @@ class ExLlamaV2ForkGeneratorAsync:
         # graphed verify rounds, per-slot prompt cache. max_batch == 1 keeps the verified
         # sequential path below untouched.
         self.max_batch = int(max_batch) if (self.mp and mtp_drafter is not None) else 1
+
+        # Prompt-cache RAM offload (opt-in, EXPERIMENTAL): a capped host-RAM cold tier
+        # for idle lineages, on both the sequential and multi-batch MP+MTP paths.
+        # EXL2_PROMPT_OFFLOAD=0 is a debug kill switch. DFlash keeps its own draft KV
+        # (no gather shadow) and is not supported. Off => every path below is unchanged.
+        self.offload_enabled = (
+            bool(prompt_cache_offload)
+            and self.mp
+            and mtp_drafter is not None
+            and not getattr(mtp_drafter, "is_dflash", False)
+            and os.environ.get("EXL2_PROMPT_OFFLOAD", "1") != "0"
+        )
+        self._cold_store = (
+            _ColdPromptStore(tp_group, prompt_cache_ram_limit_mb)
+            if self.offload_enabled else None
+        )
+        if self.offload_enabled:
+            xlogger.info(
+                f"MP MTP prompt-cache RAM offload: enabled (cap "
+                f"{prompt_cache_ram_limit_mb} MB, max_batch {self.max_batch})"
+            )
 
         # Shim for container access patterns (generator.generator.*)
         self.generator = self
@@ -435,6 +598,14 @@ class ExLlamaV2ForkGeneratorAsync:
         if self._closed:
             return
         self._closed = True
+
+        # Free the cold store's worker-local KV storage + detached ring snapshots
+        # (best-effort; worker exit releases everything anyway).
+        if self._cold_store is not None:
+            try:
+                self._cold_store.clear()
+            except Exception:
+                pass
 
         # Abort the running job, cancel anything still queued
         job = getattr(self, "_current_job", None)
@@ -527,7 +698,9 @@ class ExLlamaV2ForkGeneratorAsync:
         if row is not None:
             # Batch-mode plain solo run: reset ONLY this slot's row (other slots keep
             # their live K/V). The plain path does not maintain the append-only
-            # snapshot, so the slot's lineage is invalidated.
+            # snapshot, so the slot's lineage is invalidated (tiered to RAM first
+            # when offload is enabled, so an MTP continuation can still restore it).
+            self._offload_slot(self._batch_slots[row], row)
             self.tp_group.mtp_reset_row(row)
             self._batch_slots[row].cache_valid = False
             depth = self.tp_group.cache.max_seq_len
@@ -537,6 +710,7 @@ class ExLlamaV2ForkGeneratorAsync:
         elif self.mp:
             # Full distributed reset (current_seq_len + window_beg on every rank,
             # plus stale MTP gather buffers) -- invalidates the MP MTP prompt cache
+            self._offload_scalar_lineage()
             self.tp_group.mtp_reset_cache()
             self._cache_valid = False
         else:
@@ -696,6 +870,37 @@ class ExLlamaV2ForkGeneratorAsync:
         self._cached_pos = pg.cache.current_seq_len
         self._cache_valid = True
 
+    def _offload_scalar_lineage(self):
+        """Tier the sequential path's idle lineage (row 0) to RAM before it is
+        discarded (opt-in). Failure-soft: any error skips the offload; the reset /
+        re-prefill proceeds exactly as without the feature. Never allocates VRAM."""
+        if not self.offload_enabled or not self._cache_valid or self._cached_ids is None:
+            return
+        pg = self.tp_group
+        pos = pg.cache.current_seq_len
+        min_len = int(os.environ.get("EXL2_BATCH_CLONE_MIN", "512"))
+        if pos < min_len or pos != self._cached_pos:
+            return
+        try:
+            bundle = pg.offload_row(0, pos=pos, wb=pg.cache.window_beg)
+            if bundle is None:
+                return
+            rec = self._cold_store.put(bundle, self._cached_ids, pos,
+                                       pg.cache.window_beg, self._prompt_boundary)
+            if rec is not None:
+                xlogger.info(
+                    f"[prompt-offload] lineage -> RAM ({pos} tok, "
+                    f"{bundle['bytes'] / 2**20:.0f} MB); store "
+                    f"{self._cold_store.total / 2**20:.0f}/"
+                    f"{self._cold_store.cap / 2**20:.0f} MB, "
+                    f"{len(self._cold_store.entries)} entries"
+                )
+        except Exception as e:
+            xlogger.warning(
+                f"[prompt-offload] offload failed ({type(e).__name__}: {e}); "
+                f"lineage discarded"
+            )
+
     def _run_job_mp_mtp_impl(self, job):
         from exllamav2.mtp_mp import MTPMPDriver
 
@@ -719,7 +924,118 @@ class ExLlamaV2ForkGeneratorAsync:
                           # captured here because _prompt_boundary is overwritten
                           # with the new prompt length before begin() below
         prefill_ids = ids_cpu
-        if cached is not None:
+        cold_partial = False
+        start = 0
+        if self.offload_enabled:
+            # Cold-tier lookup: when the hot lineage will neither reuse nor restore,
+            # a RAM-resident lineage may match this prompt better. Restore it into
+            # row 0 and adopt its metadata so the decision block below runs against
+            # it (reuse / boundary restore); a divergent prompt prefills the shared
+            # prefix's suffix directly (cold_partial).
+            own_ok = False
+            if cached is not None:
+                clen0 = cached.shape[-1]
+                m0 = min(clen0, n_prompt)
+                cpos0 = self._cached_pos
+                if (torch.equal(ids_cpu[:, :m0], cached[:, :m0]) and m0 == clen0
+                        and n_prompt > min(cpos0, clen0)
+                        and -(self.mtp_window + 1) <= cpos0 - clen0 <= 8
+                        and clen0 >= pg.cache.window_beg):
+                    own_ok = True   # reuse will hit
+                elif (self._prompt_boundary > 0 and n_prompt > self._prompt_boundary
+                        and self._prompt_boundary <= clen0
+                        and torch.equal(ids_cpu[:, :self._prompt_boundary],
+                                        cached[:, :self._prompt_boundary])):
+                    own_ok = True   # boundary restore may hit
+            if not own_ok:
+                min_len = int(os.environ.get("EXL2_BATCH_CLONE_MIN", "512"))
+                cold = self._cold_store.match(ids_cpu, min_len)
+                p_own = 0
+                if cached is not None:
+                    m1 = min(cached.shape[-1], n_prompt)
+                    match1 = _prefix_match_len(ids_cpu, cached, m1)
+                    p1 = min(match1, self._cached_pos)
+                    if match1 >= min_len and p1 > 0 and p1 >= pg.cache.window_beg:
+                        p_own = p1
+                if cold is not None and cold[2] > p_own:
+                    rec, match_len, p = cold
+                    self._cold_store.touch(rec)
+                    self._offload_scalar_lineage()
+                    clen = rec["ids"].shape[-1]
+                    cpos = rec["pos"]
+                    boundary = rec["prompt_boundary"]
+                    overshoot = cpos - clen
+                    has_snap = rec["snap_wb"] is not None
+                    try:
+                        t0 = time.perf_counter()
+                        self._cold_store.n_restore += 1
+                        # Full restore + re-attach the boundary snapshot + adopt, then
+                        # decide reuse / boundary-rewind / partial inline (mirrors the
+                        # batch path). The snapshot rewinds the ring to the boundary even
+                        # after a long generation shifted it past, so a thought-stripped
+                        # continuation of a LONG cold chat restores its document.
+                        pg.restore_row(0, rec["bundle"], cpos, attach_snapshot=True)
+                        self._cached_ids = rec["ids"]
+                        self._cached_pos = cpos
+                        self._prompt_boundary = boundary
+                        self._cache_valid = True
+                        self._cold_store.consume(rec["id"])
+                        cached = self._cached_ids
+                        wb = pg.cache.window_beg
+                        if (match_len >= clen and n_prompt >= clen
+                                and torch.equal(ids_cpu[:, :clen], rec["ids"][:, :clen])
+                                and -(self.mtp_window + 1) <= overshoot <= 8
+                                and clen >= wb):
+                            start = min(cpos, clen)
+                            if cpos > clen:
+                                pg.mtp_set_seq_len(clen)
+                            reuse = True
+                            kind = "cold restore"
+                        elif (has_snap and boundary > 0
+                                and pg.restore_prompt_ring(boundary)):
+                            wb_now = pg.cache.window_beg
+                            target = min(match_len, boundary)
+                            if target >= wb_now:
+                                if target < boundary:
+                                    pg.truncate_cache(target)
+                                start = target
+                                restored = True
+                                restore_pos = boundary
+                                kind = "cold restore + boundary rewind"
+                            else:
+                                pg.mtp_reset_cache()
+                                start = 0
+                                kind = "cold restore (reset)"
+                        elif match_len >= wb:
+                            pg.truncate_cache(match_len)
+                            start = match_len
+                            kind = "cold restore (partial prefix)"
+                        else:
+                            pg.mtp_reset_cache()
+                            start = 0
+                            kind = "cold restore (reset)"
+                        if n_prompt <= start:
+                            start -= 1   # exact-match prompt: rewrite the last token
+                        prefill_ids = ids_cpu[:, start:]
+                        cold_partial = True   # cold path decided; skip the hot block
+                        dt = (time.perf_counter() - t0) * 1000
+                        xlogger.info(
+                            f"MP MTP prompt cache {kind}: restored {cpos} tok from RAM "
+                            f"in {dt:.0f} ms, prefilling {n_prompt - start} new"
+                        )
+                    except Exception as e:
+                        xlogger.warning(
+                            f"[prompt-offload] cold restore failed "
+                            f"({type(e).__name__}: {e}); dropping entry, full re-prefill"
+                        )
+                        try:
+                            self._cold_store.drop(rec["id"], "restore failed")
+                        except Exception:
+                            pass
+                        cached = self._cached_ids if self._cache_valid else None
+                        cold_partial = False
+                        prefill_ids = ids_cpu
+        if cached is not None and not cold_partial:
             clen = cached.shape[-1]
             m = min(clen, n_prompt)
             prefix_ok = torch.equal(ids_cpu[:, :m], cached[:, :m])
@@ -784,7 +1100,29 @@ class ExLlamaV2ForkGeneratorAsync:
                     at = int(diff[0]) if diff.numel() else m
                     why = f"history diverges at token {at} (re-rendered/edited prompt?)"
                 xlogger.info(f"MP MTP prompt cache miss: {why}; full re-prefill")
-        if not reuse and not restored:
+        partial_scalar = False
+        if (not reuse and not restored and not cold_partial
+                and self.offload_enabled and cached is not None):
+            # Own-lineage partial prefix (offload tier): the prompt diverges from the
+            # cached history but shares a long prefix inside the live ring. Rewind to
+            # the divergence point and prefill only the suffix.
+            min_len = int(os.environ.get("EXL2_BATCH_CLONE_MIN", "512"))
+            m = min(cached.shape[-1], n_prompt)
+            match = _prefix_match_len(ids_cpu, cached, m)
+            p = min(match, self._cached_pos)
+            if match >= min_len and p > 0 and p >= pg.cache.window_beg:
+                self._offload_scalar_lineage()
+                pg.truncate_cache(p)
+                start = p if n_prompt > p else p - 1
+                prefill_ids = ids_cpu[:, start:]
+                partial_scalar = True
+                xlogger.info(
+                    f"MP MTP prompt cache partial reuse: rewound to shared prefix "
+                    f"{p}, prefilling {n_prompt - start} new"
+                )
+        if not reuse and not restored and not cold_partial and not partial_scalar:
+            # Tier the discarded lineage to RAM (opt-in) before the full reset.
+            self._offload_scalar_lineage()
             pg.mtp_reset_cache()
         driver = MTPMPDriver(pg, self.mtp_drafter, window=self.mtp_window)
         dflash = getattr(self.mtp_drafter, "is_dflash", False)
@@ -1056,7 +1394,11 @@ class ExLlamaV2ForkGeneratorAsync:
     def _choose_slot(self, slots, free, job):
         """Prefix affinity: prefer the free slot whose cached lineage shares the longest
         prefix with the job's prompt (chat continuations land on their own slot). Any
-        free slot is correct -- _admit_job reuses or resets based on the exact check."""
+        free slot is correct -- _admit_job reuses or resets based on the exact check.
+
+        With RAM offload enabled, a COLD lineage may match better than any free slot's
+        hot lineage; then (or when nothing hot matches) pick the COLDEST free slot so
+        the least-valued idle lineage is the one evicted to RAM."""
         best, best_len = free[0], -1
         ids = job.input_ids
         for i in free:
@@ -1067,6 +1409,12 @@ class ExLlamaV2ForkGeneratorAsync:
             if m > 0 and torch.equal(s.cached_ids[:, :m], ids[:, :m]):
                 if m > best_len:
                     best, best_len = i, m
+        if self.offload_enabled:
+            min_len = int(os.environ.get("EXL2_BATCH_CLONE_MIN", "512"))
+            cold = self._cold_store.match(ids.cpu(), min_len)
+            cold_len = cold[1] if cold is not None else -1
+            if cold_len > best_len or best_len < 0:
+                return min(free, key=lambda i: (slots[i].last_used, slots[i].hits))
         return best
 
     def _clone_source(self, slots, r, ids_cpu):
@@ -1114,6 +1462,37 @@ class ExLlamaV2ForkGeneratorAsync:
             if best is None or match > best[1]:
                 best = (i, match)
         return best
+
+    def _offload_slot(self, slot, r):
+        """Tier an idle slot's lineage to RAM before its row is reused (opt-in).
+        Failure-soft: any error skips the offload and the row resets/re-prefills
+        exactly as it would without the feature. Never allocates VRAM."""
+        if not self.offload_enabled or not slot.cache_valid or slot.cached_ids is None:
+            return
+        pg = self.tp_group
+        pos = pg.cache.seq_lens[r]
+        min_len = int(os.environ.get("EXL2_BATCH_CLONE_MIN", "512"))
+        if pos < min_len or pos != slot.cached_pos:
+            return
+        try:
+            bundle = pg.offload_row(r, pos=pos, wb=pg.cache.window_begs[r])
+            if bundle is None:
+                return
+            rec = self._cold_store.put(bundle, slot.cached_ids, pos,
+                                       pg.cache.window_begs[r], slot.prompt_boundary)
+            if rec is not None:
+                xlogger.info(
+                    f"[prompt-offload] slot {r} lineage -> RAM ({pos} tok, "
+                    f"{bundle['bytes'] / 2**20:.0f} MB); store "
+                    f"{self._cold_store.total / 2**20:.0f}/"
+                    f"{self._cold_store.cap / 2**20:.0f} MB, "
+                    f"{len(self._cold_store.entries)} entries"
+                )
+        except Exception as e:
+            xlogger.warning(
+                f"[prompt-offload] offload slot {r} failed "
+                f"({type(e).__name__}: {e}); lineage discarded"
+            )
 
     def _admit_job(self, job, slot, r, driver, slots):
         """Prompt-cache decision + chunked prefill into row r, then arm the MTP row.
@@ -1170,57 +1549,171 @@ class ExLlamaV2ForkGeneratorAsync:
                     why = f"history diverges at token {at} (re-rendered/edited prompt?)"
                 xlogger.info(f"MP MTP prompt cache miss (slot {r}): {why}")
         partial = False
-        if (not reuse and not restored and slot.cache_valid
-                and slot.cached_ids is not None
-                and os.environ.get("EXL2_BATCH_KV_CLONE", "1") != "0"):
-            # Own-lineage partial prefix: the prompt diverges from this slot's history
-            # (edited/regenerated turn, different question on the same document) but
-            # shares a long prefix with it. Rewind the slot to the divergence point and
-            # prefill only the suffix -- the slot's own K/V prefix is already exactly
-            # right, so this costs a position truncation, not copies or a re-prefill.
-            clen = slot.cached_ids.shape[-1]
-            m = min(clen, n_prompt)
-            match = 0
-            if m > 0:
-                if torch.equal(ids_cpu[:, :m], slot.cached_ids[:, :m]):
-                    match = m
-                else:
-                    diff = (ids_cpu[0, :m] != slot.cached_ids[0, :m]).nonzero()
-                    match = int(diff[0]) if diff.numel() else m
-            p = min(match, slot.cached_pos)
+        cloned = False
+        cold_restored = False
+        if not reuse and not restored:
             min_len = int(os.environ.get("EXL2_BATCH_CLONE_MIN", "512"))
-            if match >= min_len and 0 < p >= pg.cache.window_begs[r]:
-                pg.truncate_row(r, p)
-                start = p
+            clone_on = os.environ.get("EXL2_BATCH_KV_CLONE", "1") != "0"
+            # Candidate 1 -- own-lineage partial prefix: the prompt diverges from this
+            # slot's history (edited/regenerated turn, different question on the same
+            # document) but shares a long prefix with it. Rewind the slot to the
+            # divergence point and prefill only the suffix -- a position truncation,
+            # not copies or a re-prefill.
+            p_own = 0
+            if slot.cache_valid and slot.cached_ids is not None and clone_on:
+                clen = slot.cached_ids.shape[-1]
+                m = min(clen, n_prompt)
+                match = _prefix_match_len(ids_cpu, slot.cached_ids, m)
+                p = min(match, slot.cached_pos)
+                if match >= min_len and 0 < p >= pg.cache.window_begs[r]:
+                    p_own = p
+            # Candidate 2 -- shared-prefix clone from another HOT slot: concurrent
+            # requests commonly share a long system / few-shot / document prefix, and
+            # a continuation whose own slot is busy would otherwise re-prefill the
+            # whole context on a free slot. A physical D2D copy (slots never share
+            # live K/V, so the isolation invariant holds).
+            src = self._clone_source(slots, r, ids_cpu) if clone_on else None
+            p_clone = src[1] if src is not None else 0
+            # Candidate 3 -- cold lineage restore from RAM (opt-in offload tier): an
+            # idle lineage evicted earlier matches this prompt; H2D its K/V + MTP
+            # shadow back instead of re-prefilling.
+            cold = (self._cold_store.match(ids_cpu, min_len)
+                    if self.offload_enabled else None)
+            p_cold = cold[2] if cold is not None else 0
+            if self.offload_enabled:
+                # Longest restorable prefix wins (prefill cost dominates copy cost);
+                # ties prefer the cheaper source: own truncate < hot clone < cold H2D.
+                best_p = max(p_own, p_clone, p_cold)
+            else:
+                # Verified precedence: own partial first, then cross-slot clone.
+                best_p = p_own if p_own > 0 else p_clone
+            if best_p > 0 and best_p == p_own:
+                self._offload_slot(slot, r)
+                pg.truncate_row(r, p_own)
+                # Exact-match prompt (n_prompt == p): rewrite the last token instead
+                # of an empty prefill (idempotent KV rewrite; an empty suffix would
+                # leave logits None and abort the job).
+                start = p_own if n_prompt > p_own else p_own - 1
                 prefill_ids = ids_cpu[:, start:]
                 partial = True
+                slot.hits += 1
                 xlogger.info(
                     f"MP MTP prompt cache partial reuse (slot {r}): rewound to shared "
-                    f"prefix {p}, prefilling {n_prompt - p} new"
+                    f"prefix {p_own}, prefilling {n_prompt - start} new"
                 )
-        cloned = False
-        if not reuse and not restored and not partial:
-            # Shared-prefix clone: concurrent requests commonly share a long system /
-            # few-shot / document prefix, and a continuation whose own slot is busy
-            # would otherwise re-prefill the whole context on a free slot. Copy the
-            # best-matching OTHER slot's committed K/V (a physical copy -- slots never
-            # share live K/V, so the isolation invariant holds) and prefill only the
-            # suffix. EXL2_BATCH_KV_CLONE=0 disables; EXL2_BATCH_CLONE_MIN sets the
-            # minimum shared prefix (tokens) worth cloning.
-            src = self._clone_source(slots, r, ids_cpu)
-            if src is not None:
+            elif best_p > 0 and best_p == p_clone:
+                self._offload_slot(slot, r)
                 i, p = src
                 pg.clone_row(i, r, p)
-                start = p
+                start = p if n_prompt > p else p - 1
                 prefill_ids = ids_cpu[:, start:]
                 cloned = True
                 xlogger.info(
                     f"MP MTP prompt cache clone (slot {r} <- slot {i}): reusing {p} "
-                    f"shared-prefix tokens, prefilling {n_prompt - p} new"
+                    f"shared-prefix tokens, prefilling {n_prompt - start} new"
                 )
-        if not reuse and not restored and not partial and not cloned:
-            pg.mtp_reset_row(r)
-            start = 0
+            elif best_p > 0 and cold is not None and best_p == p_cold:
+                rec, match_len, p = cold
+                # Keep the entry hot in the store while the row's old lineage is
+                # offloaded (the cap eviction must not drop the entry we're restoring).
+                self._cold_store.touch(rec)
+                self._offload_slot(slot, r)
+                clen = rec["ids"].shape[-1]
+                cpos = rec["pos"]
+                boundary = rec["prompt_boundary"]
+                overshoot = cpos - clen
+                has_snap = rec["snap_wb"] is not None
+                if os.environ.get("EXL2_OFFLOAD_DEBUG", "0") == "1":
+                    xlogger.info(
+                        f"[offload-dbg] slot {r} cold match={match_len} boundary={boundary} "
+                        f"p={p} pos={cpos} clen={clen} wb={rec['wb']} "
+                        f"snap_wb={rec['snap_wb']} n_prompt={n_prompt}"
+                    )
+                try:
+                    t0 = time.perf_counter()
+                    # Restore the FULL lineage state and re-attach its prompt-boundary
+                    # ring snapshot, then adopt the lineage. The snapshot is what makes a
+                    # COLD thought-stripped continuation behave like a hot one even for a
+                    # LONG conversation: it rewinds the SWA ring to the boundary after
+                    # generation shifted the ring past it, so only the re-rendered tail
+                    # re-prefills -- never the document.
+                    pg.restore_row(r, rec["bundle"], cpos, attach_snapshot=True)
+                    slot.cached_ids = rec["ids"]
+                    slot.cached_pos = cpos
+                    slot.prompt_boundary = boundary
+                    slot.cache_valid = True
+                    self._cold_store.consume(rec["id"])
+                    wb = pg.cache.window_begs[r]
+                    if (match_len >= clen and n_prompt >= clen
+                            and torch.equal(ids_cpu[:, :clen], rec["ids"][:, :clen])
+                            and -(self.mtp_window + 1) <= overshoot <= 8
+                            and clen >= wb):
+                        # strict extension -> reuse (trim uncommitted drafts)
+                        start = min(cpos, clen)
+                        if cpos > clen:
+                            pg.mtp_set_seq_len_row(r, clen)
+                        reuse = True
+                        kind = "cold restore"
+                    elif (has_snap and boundary > 0
+                            and pg.restore_prompt_ring_row(r, boundary)):
+                        # Thought-stripped / re-rendered assistant turn: rewind the ring
+                        # to the boundary snapshot, then truncate to the TRUE shared
+                        # prefix (the prompt may diverge a few tokens before the boundary
+                        # at the turn cue). Works even when the final ring shifted past
+                        # the boundary (long chats) -- the snapshot restores that K/V.
+                        wb_now = pg.cache.window_begs[r]
+                        target = min(match_len, boundary)
+                        if target >= wb_now:
+                            if target < boundary:
+                                pg.truncate_row(r, target)
+                            start = target
+                            restored = True
+                            kind = "cold restore + boundary rewind"
+                        else:
+                            pg.mtp_reset_row(r)
+                            start = 0
+                            kind = "cold restore (reset)"
+                    elif match_len >= wb:
+                        # No snapshot rewind: truncate to the shared prefix inside the
+                        # final live ring.
+                        pg.truncate_row(r, match_len)
+                        start = match_len
+                        kind = "cold restore (partial prefix)"
+                    else:
+                        pg.mtp_reset_row(r)
+                        start = 0
+                        kind = "cold restore (reset)"
+                    slot.hits += 1
+                    restored_pos = cpos
+                    dt = (time.perf_counter() - t0) * 1000
+                    if n_prompt <= start:
+                        start -= 1   # exact-match prompt: rewrite the last token
+                    prefill_ids = ids_cpu[:, start:]
+                    cold_restored = True
+                    self._cold_store.n_restore += 1
+                    xlogger.info(
+                        f"MP MTP prompt cache {kind} (slot {r}): restored {restored_pos} "
+                        f"tok from RAM in {dt:.0f} ms, prefilling {n_prompt - start} new"
+                    )
+                except Exception as e:
+                    # Failure-soft: drop the entry and re-prefill from scratch. The
+                    # job never fails because of the offload system.
+                    xlogger.warning(
+                        f"[prompt-offload] cold restore slot {r} failed "
+                        f"({type(e).__name__}: {e}); dropping entry, full re-prefill"
+                    )
+                    try:
+                        self._cold_store.drop(rec["id"], "restore failed")
+                    except Exception:
+                        pass
+                    pg.mtp_reset_row(r)
+                    start = 0
+                    prefill_ids = ids_cpu
+            else:
+                self._offload_slot(slot, r)
+                pg.mtp_reset_row(r)
+                start = 0
+        slot.last_used = time.monotonic()
         slot.cached_tokens = start
         slot.job = job
 
@@ -1389,6 +1882,7 @@ class ExLlamaV2ForkGeneratorAsync:
         slot.cached_ids = full.contiguous()
         slot.cached_pos = self.tp_group.cache.seq_lens[r]
         slot.cache_valid = True
+        slot.last_used = time.monotonic()
         slot.active = False
         slot.job = None
         slot.state = None

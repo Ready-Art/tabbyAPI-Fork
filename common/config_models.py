@@ -306,6 +306,32 @@ class ModelConfig(BaseConfigModel):
         ),
         ge=1,
     )
+    prompt_cache_offload: Optional[bool] = Field(
+        False,
+        description=(
+            "Offload idle prompt-cache lineages to host RAM (default: False).\n"
+            "ExllamaV2 ReadyArt fork only: mp tensor-parallel backend + MTP drafting\n"
+            "(single-sequence and multi-batch). The VRAM cache rows keep the hot\n"
+            "lineages; when a new job needs a row, the oldest/least-used idle lineage\n"
+            "is copied to RAM instead of being discarded, and a later request matching\n"
+            "it restores the K/V (plus the MTP draft shadow) in milliseconds instead of\n"
+            "re-prefilling the whole context. RAM usage is capped by\n"
+            "prompt_cache_ram_limit_mb; the coldest entries are evicted first when the\n"
+            "cap is reached. DFlash drafting is not supported (the option is ignored).\n"
+            "EXPERIMENTAL."
+        ),
+    )
+    prompt_cache_ram_limit_mb: Optional[int] = Field(
+        8192,
+        description=(
+            "Host RAM cap for offloaded prompt-cache lineages, in MB (default: 8192).\n"
+            "Only used when prompt_cache_offload is enabled. When the store is full,\n"
+            "the oldest/least-used lineages are dropped (a later request re-prefills\n"
+            "them). The cap is enforced before every offload; the cache system never\n"
+            "allocates VRAM and never exceeds this budget. EXPERIMENTAL."
+        ),
+        ge=256,
+    )
     prompt_template: Optional[str] = Field(
         None,
         description=(
