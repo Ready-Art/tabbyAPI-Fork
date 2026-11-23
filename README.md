@@ -200,7 +200,11 @@ multi-batch** opt-in via `max_batch_size` on MP + MTP, validated under concurren
 `max_batch_size: 4` with per-slot prompt caching and shared-prefix KV cloning; **experimental
 prompt-cache RAM offload** opt-in via `prompt_cache_offload` + `prompt_cache_ram_limit_mb`,
 tiering idle conversations to host RAM under a **whole-server** byte cap so the VRAM context
-budget is not a hard limit on cached conversations when sharing the API; full-sampler
+budget is not a hard limit on cached conversations when sharing the API; **INT8 KV cache**
+opt-in via `kv_cache_int8` (default fp16) halving long-context decode KV reads; **priority
+prompt scheduler** opt-in via `priority_queue` — shortest-first admission plus a
+reprocess-abuse penalty for shared-API serving; **engram storage modes** `ngram_mode`
+disk/ram/hybrid for n-gram models; full-sampler
 MTP on both SP and MP, no LoRAs on MP, CUDA graphs and FlashInfer knobs) are documented in
 **[docs/11.-ReadyArt-ExLlamaV2-Fork.md](docs/11.-ReadyArt-ExLlamaV2-Fork.md)**.
 
