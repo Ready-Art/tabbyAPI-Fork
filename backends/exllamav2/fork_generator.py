@@ -484,6 +484,10 @@ class ExLlamaV2ForkGeneratorAsync:
         max_batch: int = 1,
         prompt_cache_offload: bool = False,
         prompt_cache_ram_limit_mb: int = 8192,
+        priority_queue: bool = False,
+        batch_window_ms: int = 50,
+        batch_window_max_tokens: int = 4096,
+        priority_max_wait_ms: int = 30000,
     ):
         self.tokenizer = tokenizer
         # Append-only prompt cache (MP MTP): token ids whose K/V is live in the cache.
@@ -520,6 +524,21 @@ class ExLlamaV2ForkGeneratorAsync:
         # graphed verify rounds, per-slot prompt cache. max_batch == 1 keeps the verified
         # sequential path below untouched.
         self.max_batch = int(max_batch) if (self.mp and mtp_drafter is not None) else 1
+
+        # Priority prompt scheduler (multi-batch only): shortest-prompt-first admission
+        # plus a small micro-batch window that collects arriving short prompts so they
+        # admit together. Long prompts rank last; priority_max_wait_ms ages them forward
+        # to bound starvation. Off => FIFO admission, unchanged.
+        self.priority_queue = bool(priority_queue) and self.max_batch > 1
+        self.batch_window_ms = max(0, int(batch_window_ms))
+        self.batch_window_max_tokens = max(1, int(batch_window_max_tokens))
+        self.priority_max_wait_ms = max(0, int(priority_max_wait_ms))
+        if self.priority_queue:
+            xlogger.info(
+                f"Priority prompt scheduler: shortest-first, batch window "
+                f"{self.batch_window_ms} ms (<= {self.batch_window_max_tokens} tok), "
+                f"max wait {self.priority_max_wait_ms} ms"
+            )
 
         # Prompt-cache RAM offload (opt-in, EXPERIMENTAL): a capped host-RAM cold tier
         # for idle lineages, on both the sequential and multi-batch MP+MTP paths.
@@ -1264,6 +1283,25 @@ class ExLlamaV2ForkGeneratorAsync:
 
     # ------------------------------------------------------------------ multi-batch scheduler
 
+    def _pq_tag(self, j):
+        """Arrival time + prompt length for priority ordering (set once)."""
+        if not hasattr(j, "_pq_arrival"):
+            j._pq_arrival = time.monotonic()
+            try:
+                j._pq_len = int(j.input_ids.shape[-1])
+            except Exception:
+                j._pq_len = 1 << 30
+
+    def _pq_key(self, j):
+        """Shortest-first; aged jobs (waited > priority_max_wait_ms) promote ahead of
+        everything, FIFO among themselves, to bound starvation."""
+        now = time.monotonic()
+        max_wait = self.priority_max_wait_ms / 1000.0
+        aged = max_wait > 0 and now - j._pq_arrival >= max_wait
+        return (0 if aged else 1,
+                0 if aged else getattr(j, "_pq_len", 1 << 30),
+                j._pq_arrival)
+
     def _batch_scheduler(self):
         """
         Slot-based concurrency for MP + MTP (max_batch > 1).
@@ -1289,12 +1327,37 @@ class ExLlamaV2ForkGeneratorAsync:
         pending = []
         shutdown = False
 
+        def _tag(j):
+            self._pq_tag(j)
+
         while not shutdown:
             if not pending and not any(s.active for s in slots):
                 item = self._bq.get()
                 if item is None:
                     break
+                _tag(item)
                 pending.append(item)
+                # Micro-batch window: when the batch is idle, wait briefly for more
+                # arrivals before admitting, then admit shortest-first. This lets short
+                # prompts arriving alongside (or just after) a long prompt go first —
+                # a lone long prompt would otherwise admit immediately and its
+                # multi-second prefill stalls everyone. Bounded by batch_window_ms.
+                if (self.priority_queue and self.batch_window_ms > 0
+                        and not shutdown):
+                    deadline = time.monotonic() + self.batch_window_ms / 1000.0
+                    while len(pending) < self.max_batch:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        try:
+                            more = self._bq.get(timeout=remaining)
+                        except _thread_queue.Empty:
+                            break
+                        if more is None:
+                            shutdown = True
+                            break
+                        _tag(more)
+                        pending.append(more)
             while True:
                 try:
                     item = self._bq.get_nowait()
@@ -1303,10 +1366,14 @@ class ExLlamaV2ForkGeneratorAsync:
                 if item is None:
                     shutdown = True
                     break
+                _tag(item)
                 pending.append(item)
             pending = [j for j in pending if not j.cancelled]
             if shutdown:
                 break
+            # Shortest-prompt-first admission; aged jobs promote ahead (see _pq_key).
+            if self.priority_queue and len(pending) > 1:
+                pending.sort(key=self._pq_key)
             for j in pending:
                 if not hasattr(j, "_fork_eligible"):
                     j._fork_eligible = self._mp_mtp_eligible(j)
@@ -1339,7 +1406,7 @@ class ExLlamaV2ForkGeneratorAsync:
                 if j.cancelled:
                     continue
                 try:
-                    self._admit_job(j, slots[r], r, driver, slots)
+                    self._admit_job(j, slots[r], r, driver, slots, pending)
                 except Exception as e:
                     slots[r].active = False
                     slots[r].job = None
@@ -1357,6 +1424,7 @@ class ExLlamaV2ForkGeneratorAsync:
                 if item is None:
                     shutdown = True
                     break
+                _tag(item)
                 pending.append(item)
                 break
 
@@ -1494,7 +1562,7 @@ class ExLlamaV2ForkGeneratorAsync:
                 f"({type(e).__name__}: {e}); lineage discarded"
             )
 
-    def _admit_job(self, job, slot, r, driver, slots):
+    def _admit_job(self, job, slot, r, driver, slots, pending=None):
         """Prompt-cache decision + chunked prefill into row r, then arm the MTP row.
         Decode rounds for already-active slots interleave between prefill chunks."""
         pg = self.tp_group
@@ -1752,6 +1820,47 @@ class ExLlamaV2ForkGeneratorAsync:
                 # Keep active jobs decoding during long prefills: stall <= one chunk.
                 if any(s.active for s in slots):
                     self._batch_decode_round_safe(slots, driver)
+                # Priority preemption: admit newly arrived SHORT jobs between chunks of
+                # a long prefill so they don't queue behind it (short prompts first).
+                # Single-chunk jobs only, nested admission without further preemption
+                # (pending=None) -> no recursion; _prefilling_job saved/restored.
+                if self.priority_queue and pending is not None:
+                    import queue as _tq
+                    while True:
+                        try:
+                            item = self._bq.get_nowait()
+                        except _tq.Empty:
+                            break
+                        if item is None:
+                            self._bq.put(None)
+                            break
+                        self._pq_tag(item)
+                        pending.append(item)
+                    if pending:
+                        pending.sort(key=self._pq_key)
+                        for j2 in pending:
+                            if not hasattr(j2, "_fork_eligible"):
+                                j2._fork_eligible = self._mp_mtp_eligible(j2)
+                        for j2 in [j for j in pending
+                                   if getattr(j, "_fork_eligible", False)
+                                   and j.input_ids.shape[-1] <= chunk_size]:
+                            free2 = [i for i, s in enumerate(slots) if not s.active]
+                            if not free2:
+                                break
+                            r2 = self._choose_slot(slots, free2, j2)
+                            pending.remove(j2)
+                            if j2.cancelled:
+                                continue
+                            prev_pref = self._prefilling_job
+                            try:
+                                self._admit_job(j2, slots[r2], r2, driver, slots, None)
+                            except Exception as e:
+                                slots[r2].active = False
+                                slots[r2].job = None
+                                slots[r2].cache_valid = False
+                                self._put(j2, e)
+                            finally:
+                                self._prefilling_job = prev_pref
         finally:
             self._prefilling_job = None
             pg.abort_flag.clear()

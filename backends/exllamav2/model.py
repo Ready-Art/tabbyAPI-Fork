@@ -326,6 +326,13 @@ class ExllamaV2Container(BaseModelContainer):
             "1" if unwrap(kwargs.get("kv_cache_int8"), False) else "0"
         )
 
+        # Priority prompt scheduler (MP+MTP multi-batch): shortest-first admission
+        # with a small micro-batch window for short prompts.
+        self.priority_queue = unwrap(kwargs.get("priority_queue"), False)
+        self.batch_window_ms = unwrap(kwargs.get("batch_window_ms"), 50)
+        self.batch_window_max_tokens = unwrap(kwargs.get("batch_window_max_tokens"), 4096)
+        self.priority_max_wait_ms = unwrap(kwargs.get("priority_max_wait_ms"), 30000)
+
         # Catch exllamav3 cache_mode
         if self.cache_mode != "FP16" and not self.cache_mode.startswith("Q"):
             xlogger.warning(
@@ -1136,6 +1143,10 @@ class ExllamaV2Container(BaseModelContainer):
                     max_batch=self.max_batch_size,
                     prompt_cache_offload=self.prompt_cache_offload,
                     prompt_cache_ram_limit_mb=self.prompt_cache_ram_limit_mb,
+                    priority_queue=self.priority_queue,
+                    batch_window_ms=self.batch_window_ms,
+                    batch_window_max_tokens=self.batch_window_max_tokens,
+                    priority_max_wait_ms=self.priority_max_wait_ms,
                 )
             else:
                 self.generator = ExLlamaV2DynamicGeneratorAsync(

@@ -516,6 +516,44 @@ class DraftModelConfig(BaseConfigModel):
             "KV VRAM. MP backend, full layers only in this release."
         ),
     )
+    priority_queue: Optional[bool] = Field(
+        False,
+        description=(
+            "Shortest-prompt-first admission for MP+MTP multi-batch (default: False).\n"
+            "ExllamaV2 ReadyArt fork only, requires max_batch_size > 1. Large prefills\n"
+            "stall concurrent generation, so short prompts are admitted first and long\n"
+            "prompts last. A small batching window (batch_window_ms) collects arriving\n"
+            "short prompts so they can be admitted together into the batch slots.\n"
+            "priority_max_wait_ms ages long prompts forward to bound starvation."
+        ),
+    )
+    batch_window_ms: Optional[int] = Field(
+        50,
+        description=(
+            "Micro-batch admission window in milliseconds (default: 50).\n"
+            "When priority_queue is on and a SHORT prompt arrives to an idle batch,\n"
+            "wait up to this long for more short prompts before admitting, so they\n"
+            "batch together. Keep small to avoid frustrating API latency. 0 disables\n"
+            "the window (pure shortest-first ordering)."
+        ),
+    )
+    batch_window_max_tokens: Optional[int] = Field(
+        4096,
+        description=(
+            "Prompt-length threshold for the batching window (default: 4096 tokens).\n"
+            "Only prompts at or below this length trigger the collection window;\n"
+            "longer prompts are admitted immediately (and ranked last)."
+        ),
+    )
+    priority_max_wait_ms: Optional[int] = Field(
+        30000,
+        description=(
+            "Starvation guard for priority_queue (default: 30000 ms).\n"
+            "A pending prompt that has waited longer than this is promoted ahead of\n"
+            "shorter prompts, so a continuous stream of short requests cannot block\n"
+            "a long prompt indefinitely."
+        ),
+    )
 
 
 class SamplingConfig(BaseConfigModel):
