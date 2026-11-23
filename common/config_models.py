@@ -499,14 +499,15 @@ class ModelConfig(BaseConfigModel):
     priority_preempt: Optional[bool] = Field(
         False,
         description=(
-            "EXPERIMENTAL mid-prefill preemption (default: False — KNOWN BROKEN).\n"
-            "With priority_queue on, admit newly arrived short jobs between chunks of\n"
-            "a long prefill. Two crash causes were fixed (negative full-layer gather\n"
-            "delta on slot reuse; pending-list removal races), but a third remains:\n"
-            "the batch MTP driver's recommit asserts 'invalid position' when a slot is\n"
-            "reused while the driver holds speculative row state. Needs admission/\n"
-            "round-boundary state-sync redesign. Leave OFF. Without it, short prompts\n"
-            "still go ahead of PENDING long prompts and the reprocess penalty applies."
+            "Mid-prefill preemption (default: False, opt-in).\n"
+            "With priority_queue on, admit newly arrived single-chunk short jobs\n"
+            "between chunks of a long prefill so they decode while it continues.\n"
+            "The earlier slot-reuse crash chain (negative gather delta, pending-list\n"
+            "races, batch MTP 'recommit: invalid position') is fixed: a slot is free\n"
+            "only when it holds no job, so a nested admission can never reset the\n"
+            "prefilling row. Verified under contention (batch 4, 21k prefill + 5\n"
+            "shorts mid-prefill). Without it, short prompts still go ahead of\n"
+            "PENDING long prompts and the reprocess penalty applies."
         ),
     )
 

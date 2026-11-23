@@ -1456,7 +1456,8 @@ class ExLlamaV2ForkGeneratorAsync:
             for j in [j for j in pending if j._fork_eligible and not self._pq_held(j)]:
                 if j not in pending:
                     continue  # admitted by mid-prefill preemption during a prior admission
-                free = [i for i, s in enumerate(slots) if not s.active]
+                free = [i for i, s in enumerate(slots)
+                        if not s.active and s.job is None]
                 if not free:
                     break
                 r = self._choose_slot(slots, free, j)
@@ -1466,9 +1467,10 @@ class ExLlamaV2ForkGeneratorAsync:
                 try:
                     self._admit_job(j, slots[r], r, driver, slots, pending)
                 except Exception as e:
-                    slots[r].active = False
-                    slots[r].job = None
-                    slots[r].cache_valid = False
+                    if slots[r].job in (None, j):
+                        slots[r].active = False
+                        slots[r].job = None
+                        slots[r].cache_valid = False
                     self._put(j, e)
 
             # Held abusers (or transient no-free-slot): avoid a busy spin while waiting.
@@ -1627,6 +1629,11 @@ class ExLlamaV2ForkGeneratorAsync:
     def _admit_job(self, job, slot, r, driver, slots, pending=None):
         """Prompt-cache decision + chunked prefill into row r, then arm the MTP row.
         Decode rounds for already-active slots interleave between prefill chunks."""
+        # `active` stays False through the whole chunked prefill, so a busy slot is
+        # identified by its job reference; admitting into one would reset the row
+        # under a running prefill / live driver state.
+        if slot.active or slot.job is not None:
+            raise RuntimeError(f"admission into busy slot {r}")
         pg = self.tp_group
         ids_cpu = job.input_ids.cpu()
         n_prompt = ids_cpu.shape[-1]
@@ -1900,10 +1907,12 @@ class ExLlamaV2ForkGeneratorAsync:
                 if any(s.active for s in slots):
                     self._batch_decode_round_safe(slots, driver)
                 # Priority preemption (opt-in priority_preempt): admit newly arrived
-                # SHORT jobs between chunks of a long prefill. EXPERIMENTAL: can crash
-                # the batch KV gather (negative shape) when rows admit mid-prefill;
-                # default off until root-caused. Single-chunk jobs only, nested
-                # admission without further preemption; _prefilling_job saved/restored.
+                # SHORT jobs between chunks of a long prefill. Single-chunk jobs only,
+                # nested admission without further preemption; _prefilling_job
+                # saved/restored. A slot is free only if it holds NO job: the prefilling
+                # slot itself has active=False (set only at begin_row) but job!=None --
+                # admitting into it would reset the row under the running prefill and
+                # desync the batch driver ("recommit: invalid position").
                 if self.priority_queue and self.priority_preempt and pending is not None:
                     import queue as _tq
                     while True:
@@ -1925,7 +1934,8 @@ class ExLlamaV2ForkGeneratorAsync:
                                    if getattr(j, "_fork_eligible", False)
                                    and j.input_ids.shape[-1] <= chunk_size
                                    and not self._pq_held(j)]:
-                            free2 = [i for i, s in enumerate(slots) if not s.active]
+                            free2 = [i for i, s in enumerate(slots)
+                                     if not s.active and s.job is None]
                             if not free2:
                                 break
                             r2 = self._choose_slot(slots, free2, j2)
@@ -1936,9 +1946,10 @@ class ExLlamaV2ForkGeneratorAsync:
                             try:
                                 self._admit_job(j2, slots[r2], r2, driver, slots, None)
                             except Exception as e:
-                                slots[r2].active = False
-                                slots[r2].job = None
-                                slots[r2].cache_valid = False
+                                if slots[r2].job in (None, j2):
+                                    slots[r2].active = False
+                                    slots[r2].job = None
+                                    slots[r2].cache_valid = False
                                 self._put(j2, e)
                             finally:
                                 self._prefilling_job = prev_pref
