@@ -34,10 +34,37 @@ def signal_handler(*_):
 
     xlogger.warning("Shutdown signal called. Exiting gracefully.")
 
+    # Two watchdogs. The thread watchdog hard-exits after 15 s in the common case.
+    # BUT os._exit() from a Python thread needs the GIL: if the unload path is stuck in
+    # a GIL-holding C call (a blocked NCCL/P2P teardown collective whose peers are gone),
+    # the thread can never reacquire the GIL and the process hangs forever holding VRAM
+    # (observed: SIGTERM left the server alive 4+ min). The fork watchdog is an INDEPENDENT
+    # process that SIGKILLs us after 20 s no matter what the parent's GIL/threads are doing,
+    # guaranteeing exit + VRAM release. The child only sleeps and kills -- it never touches
+    # CUDA, so forking a CUDA process here is safe.
     def _watchdog():
         time.sleep(15)
         os._exit(0)
     threading.Thread(target = _watchdog, daemon = True).start()
+
+    try:
+        _pid = os.getpid()
+        if os.fork() == 0:
+            # Child: SIGKILL the parent after the grace period if it is STILL alive.
+            # If the parent exits normally it reparents us (getppid changes) -> we exit
+            # without killing, which also avoids ever signaling a reused PID.
+            _ppid = os.getppid()
+            for _ in range(40):
+                time.sleep(0.5)
+                if os.getppid() != _ppid:
+                    os._exit(0)
+            try:
+                os.kill(_pid, signal.SIGKILL)
+            except OSError:
+                pass
+            os._exit(0)
+    except OSError:
+        pass
 
     try:
         loop = asyncio.get_running_loop()
