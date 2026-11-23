@@ -70,25 +70,17 @@ For a step-by-step guide, choose the format that works best for you:
 
 This fork ([Ready-Art/tabbyAPI-Fork](https://github.com/Ready-Art/tabbyAPI-Fork), branch `ReadyArt`)
 supports the [ReadyArt ExLlamaV2 fork](https://github.com/Ready-Art/exllamav2-Fork): single-process (`sp`)
-and multiprocess (`mp`) tensor parallelism, MTP speculative decoding on both, TP CUDA graphs, and
-Gemma-4 thinking / tool calls. The fork is built and tested on **SM86 (Ampere — RTX 3090)**; other
-architectures are untested.
+and multiprocess (`mp`) tensor parallelism, MTP speculative decoding on both, TP CUDA graphs, the
+**EXL2.5 quantization format**, and Gemma-4 thinking / tool calls.
 
-> **Development focus & testing environment.** The majority of the work has gone into the
-> **MP + CUDA graphs + MTP path** (multiprocess TP, whole-step CUDA graphs, Gemma-4 MTP), including
-> a custom PCIe P2P collective kernel. It is tested on **4× RTX 3090 (sm86) on a PCI switch with P2P
-> enabled**, launched with `NCCL_P2P_LEVEL=PXB python main.py` (the `PXB` value depends on your
-> topology). The 3090s are **power-limited to 200 W each via [LACT](https://github.com/ilya-zlobintsev/LACT)**
-> (stock 350 W), so **performance will be significantly better on full-powered GPUs** — the reported
-> numbers are a 200 W-cap lower bound. **Other configurations work but are not the priority** — `sp`, the `native` paged
-> backend, non-MTP decoding, other architectures and other model families are functional but get
-> far less optimization effort and **will not match the performance of the MP + CUDA + MTP path**
-> on the tested rig. Only Gemma-4-31B-IT has been tested end-to-end.
->
-> **Feedback & contributions:** want a change? Open a
-> [GitHub issue](https://github.com/Ready-Art/exllamav2-Fork/issues) (or on
-> [this repo](https://github.com/Ready-Art/tabbyAPI-Fork/issues) for the API integration).
-> **Pull requests are welcome** — open a PR against the `ReadyArt` branch describing what and why.
+> **Scope.** Built and tested on **SM86 (Ampere — RTX 3090)**, end-to-end on **Gemma-4-31B-IT** only.
+> The primary, optimized path is **MP + CUDA graphs + MTP** on **4× RTX 3090, PCIe P2P
+> (`NCCL_P2P_LEVEL=PXB`), 200 W power cap per card** — reported numbers are a 200 W-cap lower
+> bound; full-powered GPUs are significantly faster. `sp`, `native`, non-MTP and other model
+> families work but are secondary. Details, caveats and the full feature list:
+> [docs/11.-ReadyArt-ExLlamaV2-Fork.md](docs/11.-ReadyArt-ExLlamaV2-Fork.md) and the
+> [exllamav2-Fork README](https://github.com/Ready-Art/exllamav2-Fork).
+> Issues and PRs welcome on either repo, against the `ReadyArt` branch.
 
 **Requirements:** Python 3.12, a CUDA build of PyTorch with a CUDA toolkit (`nvcc` on `PATH`),
 **FlashInfer >= 0.7.4** (a hard requirement of the fork), and **Flash-Attention 2 — required for now
@@ -157,7 +149,7 @@ model:
   model_name: Gemma-4-31B-IT-EXL2-6.0BPW-HB16
   backend: exllamav2
   max_seq_len: 160000
-  cache_size: 160000
+  cache_size: 160000            # per-row KV depth; the ~68 tok/s recipe below uses 32768
   chunk_size: 2048
   tensor_parallel: true
   tensor_parallel_backend: mp     # one worker process per GPU (the primary tested path)
@@ -184,6 +176,15 @@ With `draft_num_tokens: 3` and the whole-window drafter graph enabled
 (`EXL2_MTP_DRAFT_GRAPH=1`), this measures **~68 tok/s generation** on Gemma-4-31B-IT at
 ~1.3k context (temperature-1 sampling, 4× RTX 3090 power-limited to 200 W, `cache_size: 32768`,
 `chunk_size: 2048`, `gpu_split: [22, 22, 22, 22]`, `max_batch_size: 1`; 2026-11-21).
+
+**EXL2.5 models:** checkpoints converted with the fork's EXL2.5 format (uniform-bit fast path,
+optional Hadamard/AWQ) load automatically — the format tags are self-describing in the
+safetensors, so no config switch is needed; just point `model_name` at the directory. The
+fork's CUDA extension must be built from the `ReadyArt` branch (EXL2.5 tensors are served by
+its fast-path kernels; had/awq tensors cannot run on the legacy kernel). Plain EXL2 models are
+unaffected. See the
+[exllamav2-Fork README](https://github.com/Ready-Art/exllamav2-Fork#exl25-quantization-format)
+for the format rules and conversion flags.
 
 `NCCL_P2P_LEVEL=PXB` enables PCIe peer-to-peer across the PCI switch on the tested 4× RTX 3090
 box. **The right value depends on your topology** — `PXB`/`PHB`/`SYS`/`NODE` describe how far
