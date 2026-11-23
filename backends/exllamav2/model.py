@@ -332,6 +332,12 @@ class ExllamaV2Container(BaseModelContainer):
             "1" if unwrap(kwargs.get("kv_cache_int8"), False) else "0"
         )
 
+        # MoE expert CPU/RAM offload by count (ReadyArt fork; default 0 = off). Read
+        # by the MoE MLP constructor, so set it before load.
+        os.environ["EXL2_MOE_OFFLOAD"] = str(
+            max(0, int(unwrap(kwargs.get("moe_offload_experts"), 0) or 0))
+        )
+
         # Engram (n-gram) table storage: disk / ram / hybrid (ReadyArt fork). Read by
         # the ngram module constructor, so set it before load.
         os.environ["EXL2_NGRAM_MODE"] = str(unwrap(kwargs.get("ngram_mode"), "disk"))

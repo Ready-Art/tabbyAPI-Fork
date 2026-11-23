@@ -397,6 +397,18 @@ class ModelConfig(BaseConfigModel):
             "KV VRAM. MP backend, full layers only in this release."
         ),
     )
+    moe_offload_experts: Optional[int] = Field(
+        0,
+        description=(
+            "MoE expert CPU/RAM offload BY EXPERT COUNT (default: 0 = off).\n"
+            "ExllamaV2 ReadyArt fork only. Sets EXL2_MOE_OFFLOAD. The last N experts\n"
+            "of every MoE layer live in pinned host RAM; one shared GPU staging slot\n"
+            "per layer is H2D-filled on demand when routing selects them. N >= the\n"
+            "model's expert count offloads ALL experts. Forces the per-expert torch\n"
+            "loop (the fused MoE kernel needs every expert resident) — slower decode,\n"
+            "much lower VRAM. Single-device load path (no TP sharding) in this release."
+        ),
+    )
     priority_queue: Optional[bool] = Field(
         False,
         description=(
