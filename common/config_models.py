@@ -499,11 +499,14 @@ class ModelConfig(BaseConfigModel):
     priority_preempt: Optional[bool] = Field(
         False,
         description=(
-            "EXPERIMENTAL mid-prefill preemption (default: False).\n"
+            "EXPERIMENTAL mid-prefill preemption (default: False — KNOWN BROKEN).\n"
             "With priority_queue on, admit newly arrived short jobs between chunks of\n"
-            "a long prefill. Currently can crash the batch KV gather when rows admit\n"
-            "mid-prefill; leave off until root-caused. Without it, short prompts still\n"
-            "go ahead of PENDING long prompts and the reprocess penalty still applies."
+            "a long prefill. Two crash causes were fixed (negative full-layer gather\n"
+            "delta on slot reuse; pending-list removal races), but a third remains:\n"
+            "the batch MTP driver's recommit asserts 'invalid position' when a slot is\n"
+            "reused while the driver holds speculative row state. Needs admission/\n"
+            "round-boundary state-sync redesign. Leave OFF. Without it, short prompts\n"
+            "still go ahead of PENDING long prompts and the reprocess penalty applies."
         ),
     )
 

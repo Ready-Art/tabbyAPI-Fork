@@ -1437,6 +1437,8 @@ class ExLlamaV2ForkGeneratorAsync:
                 while any(s.active for s in slots):
                     self._batch_decode_round_safe(slots, driver)
                 for j in plain:
+                    if j not in pending:
+                        continue
                     pending.remove(j)
                     if j.cancelled:
                         continue
@@ -1452,6 +1454,8 @@ class ExLlamaV2ForkGeneratorAsync:
                 continue
 
             for j in [j for j in pending if j._fork_eligible and not self._pq_held(j)]:
+                if j not in pending:
+                    continue  # admitted by mid-prefill preemption during a prior admission
                 free = [i for i, s in enumerate(slots) if not s.active]
                 if not free:
                     break
