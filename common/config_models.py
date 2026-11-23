@@ -554,6 +554,67 @@ class DraftModelConfig(BaseConfigModel):
             "a long prompt indefinitely."
         ),
     )
+    reprocess_min_tokens: Optional[int] = Field(
+        8192,
+        description=(
+            "Reprocess-abuse penalty threshold (default: 8192 tokens).\n"
+            "With priority_queue on, prompts at least this long that FULLY re-prefill\n"
+            "from scratch (cache miss — not a continuation or re-rendered last reply)\n"
+            "are tracked by prompt fingerprint. Repeated full reprocesses of the same\n"
+            "long document are deprioritized behind well-behaved traffic."
+        ),
+    )
+    reprocess_strikes: Optional[int] = Field(
+        2,
+        description=(
+            "Full-reprocess strikes before deprioritization (default: 2).\n"
+            "The first full prefill of a long document is normal; from this many full\n"
+            "reprocesses within reprocess_window_s, repeats of that fingerprint rank\n"
+            "last and are held briefly before admission."
+        ),
+    )
+    reprocess_window_s: Optional[int] = Field(
+        300,
+        description=(
+            "Strike counting window in seconds (default: 300).\n"
+            "Full-reprocess strikes older than this expire."
+        ),
+    )
+    reprocess_hold_ms: Optional[int] = Field(
+        5000,
+        description=(
+            "Admission hold for flagged reprocess abusers (default: 5000 ms).\n"
+            "Flagged prompts wait this long before admission so well-behaved arrivals\n"
+            "can jump ahead. reprocess_max_wait_ms overrides the hold."
+        ),
+    )
+    reprocess_max_wait_ms: Optional[int] = Field(
+        120000,
+        description=(
+            "Starvation guard for flagged abusers (default: 120000 ms).\n"
+            "Longer than priority_max_wait_ms — delays for abusers are intentional,\n"
+            "but they still eventually run."
+        ),
+    )
+    ngram_mode: Optional[str] = Field(
+        "disk",
+        description=(
+            "Engram (hashed n-gram embedding) table storage (default: disk).\n"
+            "ExllamaV2 ReadyArt fork only, for models with engram tables (e.g.\n"
+            "Qwen3.8-Flash-Next). 'disk': pread rows from the safetensors file on\n"
+            "SSD/NVMe per lookup (no host RAM cost). 'ram': full table resident in\n"
+            "host RAM (fastest, can be tens of GB). 'hybrid': disk + a bounded LRU\n"
+            "row cache in host RAM (ngram_hybrid_mb) — hot n-grams serve from RAM,\n"
+            "cold rows pread. Sets EXL2_NGRAM_MODE. Never resident in VRAM."
+        ),
+    )
+    ngram_hybrid_mb: Optional[int] = Field(
+        1024,
+        description=(
+            "Host-RAM budget for the hybrid ngram row cache in MB (default: 1024).\n"
+            "Only used when ngram_mode is 'hybrid'. Sets EXL2_NGRAM_HYBRID_MB."
+        ),
+    )
 
 
 class SamplingConfig(BaseConfigModel):

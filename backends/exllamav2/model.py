@@ -326,12 +326,22 @@ class ExllamaV2Container(BaseModelContainer):
             "1" if unwrap(kwargs.get("kv_cache_int8"), False) else "0"
         )
 
+        # Engram (n-gram) table storage: disk / ram / hybrid (ReadyArt fork). Read by
+        # the ngram module constructor, so set it before load.
+        os.environ["EXL2_NGRAM_MODE"] = str(unwrap(kwargs.get("ngram_mode"), "disk"))
+        os.environ["EXL2_NGRAM_HYBRID_MB"] = str(unwrap(kwargs.get("ngram_hybrid_mb"), 1024))
+
         # Priority prompt scheduler (MP+MTP multi-batch): shortest-first admission
         # with a small micro-batch window for short prompts.
         self.priority_queue = unwrap(kwargs.get("priority_queue"), False)
         self.batch_window_ms = unwrap(kwargs.get("batch_window_ms"), 50)
         self.batch_window_max_tokens = unwrap(kwargs.get("batch_window_max_tokens"), 4096)
         self.priority_max_wait_ms = unwrap(kwargs.get("priority_max_wait_ms"), 30000)
+        self.reprocess_min_tokens = unwrap(kwargs.get("reprocess_min_tokens"), 8192)
+        self.reprocess_strikes = unwrap(kwargs.get("reprocess_strikes"), 2)
+        self.reprocess_window_s = unwrap(kwargs.get("reprocess_window_s"), 300)
+        self.reprocess_hold_ms = unwrap(kwargs.get("reprocess_hold_ms"), 5000)
+        self.reprocess_max_wait_ms = unwrap(kwargs.get("reprocess_max_wait_ms"), 120000)
 
         # Catch exllamav3 cache_mode
         if self.cache_mode != "FP16" and not self.cache_mode.startswith("Q"):
@@ -1147,6 +1157,11 @@ class ExllamaV2Container(BaseModelContainer):
                     batch_window_ms=self.batch_window_ms,
                     batch_window_max_tokens=self.batch_window_max_tokens,
                     priority_max_wait_ms=self.priority_max_wait_ms,
+                    reprocess_min_tokens=self.reprocess_min_tokens,
+                    reprocess_strikes=self.reprocess_strikes,
+                    reprocess_window_s=self.reprocess_window_s,
+                    reprocess_hold_ms=self.reprocess_hold_ms,
+                    reprocess_max_wait_ms=self.reprocess_max_wait_ms,
                 )
             else:
                 self.generator = ExLlamaV2DynamicGeneratorAsync(

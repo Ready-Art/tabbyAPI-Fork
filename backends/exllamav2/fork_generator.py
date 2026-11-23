@@ -488,6 +488,11 @@ class ExLlamaV2ForkGeneratorAsync:
         batch_window_ms: int = 50,
         batch_window_max_tokens: int = 4096,
         priority_max_wait_ms: int = 30000,
+        reprocess_min_tokens: int = 8192,
+        reprocess_strikes: int = 2,
+        reprocess_window_s: int = 300,
+        reprocess_hold_ms: int = 5000,
+        reprocess_max_wait_ms: int = 120000,
     ):
         self.tokenizer = tokenizer
         # Append-only prompt cache (MP MTP): token ids whose K/V is live in the cache.
@@ -533,11 +538,24 @@ class ExLlamaV2ForkGeneratorAsync:
         self.batch_window_ms = max(0, int(batch_window_ms))
         self.batch_window_max_tokens = max(1, int(batch_window_max_tokens))
         self.priority_max_wait_ms = max(0, int(priority_max_wait_ms))
+        # Reprocess-abuse penalty: long prompts that repeatedly FULLY re-prefill (cache
+        # miss every reply — e.g. a 20k document re-sent each turn) are deprioritized
+        # behind well-behaved traffic and held briefly before admission. Tracked by
+        # prompt fingerprint (prefix hash + length bucket), so edited variants of the
+        # same document count together; genuinely new documents are not penalized.
+        self.reprocess_min_tokens = max(1024, int(reprocess_min_tokens))
+        self.reprocess_strikes = max(1, int(reprocess_strikes))
+        self.reprocess_window_s = max(1, int(reprocess_window_s))
+        self.reprocess_hold_ms = max(0, int(reprocess_hold_ms))
+        self.reprocess_max_wait_ms = max(0, int(reprocess_max_wait_ms))
+        self._reprocess_hits = {}
         if self.priority_queue:
             xlogger.info(
                 f"Priority prompt scheduler: shortest-first, batch window "
                 f"{self.batch_window_ms} ms (<= {self.batch_window_max_tokens} tok), "
-                f"max wait {self.priority_max_wait_ms} ms"
+                f"max wait {self.priority_max_wait_ms} ms; reprocess penalty >= "
+                f"{self.reprocess_min_tokens} tok x{self.reprocess_strikes} strikes/"
+                f"{self.reprocess_window_s}s, hold {self.reprocess_hold_ms} ms"
             )
 
         # Prompt-cache RAM offload (opt-in, EXPERIMENTAL): a capped host-RAM cold tier
@@ -1284,23 +1302,57 @@ class ExLlamaV2ForkGeneratorAsync:
     # ------------------------------------------------------------------ multi-batch scheduler
 
     def _pq_tag(self, j):
-        """Arrival time + prompt length for priority ordering (set once)."""
+        """Arrival time + prompt length + reprocess-abuse flag (set once).
+
+        Fingerprint = hash of the prompt's first 256 tokens + length bucket: identifies
+        the same long document re-sent reply after reply (edited variants share the
+        prefix). The strike HISTORY is updated at admission when a full re-prefill is
+        detected; here we only read it, so ordering reflects past behavior.
+        """
         if not hasattr(j, "_pq_arrival"):
             j._pq_arrival = time.monotonic()
             try:
-                j._pq_len = int(j.input_ids.shape[-1])
+                ids = j.input_ids
+                j._pq_len = int(ids.shape[-1])
+                if j._pq_len >= self.reprocess_min_tokens:
+                    head = ids[0, :min(256, j._pq_len)].to(torch.long).cpu().numpy().tobytes()
+                    j._pq_fp = (hash(head), j._pq_len // 1024)
+                    now = time.monotonic()
+                    hist = self._reprocess_hits.get(j._pq_fp)
+                    if hist:
+                        hist[:] = [t for t in hist if now - t <= self.reprocess_window_s]
+                        j._pq_abuser = len(hist) >= self.reprocess_strikes
+                    else:
+                        j._pq_abuser = False
+                else:
+                    j._pq_fp = None
+                    j._pq_abuser = False
             except Exception:
                 j._pq_len = 1 << 30
+                j._pq_fp = None
+                j._pq_abuser = False
 
     def _pq_key(self, j):
-        """Shortest-first; aged jobs (waited > priority_max_wait_ms) promote ahead of
-        everything, FIFO among themselves, to bound starvation."""
+        """Shortest-first; reprocess abusers rank behind well-behaved traffic; aged jobs
+        promote ahead of everything (FIFO among themselves) to bound starvation. Abusers
+        age on the longer reprocess_max_wait_ms — delays for them are intentional."""
         now = time.monotonic()
-        max_wait = self.priority_max_wait_ms / 1000.0
+        abuser = getattr(j, "_pq_abuser", False)
+        max_wait = (self.reprocess_max_wait_ms if abuser else self.priority_max_wait_ms) / 1000.0
         aged = max_wait > 0 and now - j._pq_arrival >= max_wait
-        return (0 if aged else 1,
-                0 if aged else getattr(j, "_pq_len", 1 << 30),
-                j._pq_arrival)
+        cls = 0 if aged else (2 if abuser else 1)
+        return (cls, 0 if aged else getattr(j, "_pq_len", 1 << 30), j._pq_arrival)
+
+    def _pq_held(self, j):
+        """Abuser jobs are held briefly before admission so well-behaved arrivals can
+        jump ahead; aging (reprocess_max_wait_ms) overrides the hold."""
+        if not getattr(j, "_pq_abuser", False) or self.reprocess_hold_ms <= 0:
+            return False
+        now = time.monotonic()
+        if self.reprocess_max_wait_ms > 0 and \
+                now - j._pq_arrival >= self.reprocess_max_wait_ms / 1000.0:
+            return False
+        return now - j._pq_arrival < self.reprocess_hold_ms / 1000.0
 
     def _batch_scheduler(self):
         """
@@ -1397,7 +1449,7 @@ class ExLlamaV2ForkGeneratorAsync:
                         self._put(j, e)
                 continue
 
-            for j in [j for j in pending if j._fork_eligible]:
+            for j in [j for j in pending if j._fork_eligible and not self._pq_held(j)]:
                 free = [i for i, s in enumerate(slots) if not s.active]
                 if not free:
                     break
@@ -1412,6 +1464,10 @@ class ExLlamaV2ForkGeneratorAsync:
                     slots[r].job = None
                     slots[r].cache_valid = False
                     self._put(j, e)
+
+            # Held abusers (or transient no-free-slot): avoid a busy spin while waiting.
+            if pending and not any(s.active for s in slots):
+                time.sleep(0.02)
 
             while any(s.active for s in slots):
                 self._batch_decode_round_safe(slots, driver)
@@ -1785,6 +1841,23 @@ class ExLlamaV2ForkGeneratorAsync:
         slot.cached_tokens = start
         slot.job = job
 
+        # Reprocess-abuse strike: a LONG prompt fully re-prefilled from scratch (no
+        # reuse/restore/clone/cold-restore). Re-rendered last replies take the partial
+        # paths above and never strike. Repeated strikes deprioritize future repeats of
+        # the same fingerprint (see _pq_tag/_pq_key).
+        if (self.priority_queue and getattr(job, "_pq_fp", None) is not None
+                and start == 0 and not reuse and not restored and not cloned
+                and not cold_restored and n_prompt >= self.reprocess_min_tokens):
+            _now = time.monotonic()
+            _hist = self._reprocess_hits.setdefault(job._pq_fp, [])
+            _hist.append(_now)
+            _hist[:] = [t for t in _hist if _now - t <= self.reprocess_window_s]
+            if len(_hist) >= self.reprocess_strikes:
+                xlogger.info(
+                    f"Priority scheduler: reprocess strike {len(_hist)} on long prompt "
+                    f"({n_prompt} tok, full re-prefill) — repeats deprioritized + held"
+                )
+
         time_start = time.perf_counter()
         pg.abort_flag.clear()
         self._prefilling_job = job
@@ -1843,7 +1916,8 @@ class ExLlamaV2ForkGeneratorAsync:
                                 j2._fork_eligible = self._mp_mtp_eligible(j2)
                         for j2 in [j for j in pending
                                    if getattr(j, "_fork_eligible", False)
-                                   and j.input_ids.shape[-1] <= chunk_size]:
+                                   and j.input_ids.shape[-1] <= chunk_size
+                                   and not self._pq_held(j)]:
                             free2 = [i for i, s in enumerate(slots) if not s.active]
                             if not free2:
                                 break
