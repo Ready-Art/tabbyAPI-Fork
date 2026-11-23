@@ -504,6 +504,18 @@ class DraftModelConfig(BaseConfigModel):
             "Eager drafting remains the fallback if capture fails."
         ),
     )
+    kv_cache_int8: Optional[bool] = Field(
+        False,
+        description=(
+            "INT8 KV cache shadow for plain decode (default: False = fp16).\n"
+            "ExllamaV2 ReadyArt fork only. Sets EXL2_KV_INT8. Ampere has no FP8, so\n"
+            "K/V are symmetric per-(token,head) INT8 with fp16 scales, dequantized\n"
+            "in-register by a custom flash-decode kernel — half the KV read bytes\n"
+            "for base (non-MTP) decode on the full-attention layers. The fp16 cache\n"
+            "remains primary (verify/prefill/SWA unchanged); the shadow adds ~50%\n"
+            "KV VRAM. MP backend, full layers only in this release."
+        ),
+    )
 
 
 class SamplingConfig(BaseConfigModel):

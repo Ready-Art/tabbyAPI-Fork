@@ -320,6 +320,12 @@ class ExllamaV2Container(BaseModelContainer):
         # Get cache mode
         self.cache_mode = unwrap(kwargs.get("cache_mode"), "FP16")
 
+        # INT8 KV shadow for plain decode (ReadyArt fork; default fp16). The env var
+        # is read by the fork's cache constructor, so set it before load.
+        os.environ["EXL2_KV_INT8"] = (
+            "1" if unwrap(kwargs.get("kv_cache_int8"), False) else "0"
+        )
+
         # Catch exllamav3 cache_mode
         if self.cache_mode != "FP16" and not self.cache_mode.startswith("Q"):
             xlogger.warning(
