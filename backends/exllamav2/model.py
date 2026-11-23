@@ -342,6 +342,7 @@ class ExllamaV2Container(BaseModelContainer):
         self.reprocess_window_s = unwrap(kwargs.get("reprocess_window_s"), 300)
         self.reprocess_hold_ms = unwrap(kwargs.get("reprocess_hold_ms"), 5000)
         self.reprocess_max_wait_ms = unwrap(kwargs.get("reprocess_max_wait_ms"), 120000)
+        self.priority_preempt = unwrap(kwargs.get("priority_preempt"), False)
 
         # Catch exllamav3 cache_mode
         if self.cache_mode != "FP16" and not self.cache_mode.startswith("Q"):
@@ -1162,6 +1163,7 @@ class ExllamaV2Container(BaseModelContainer):
                     reprocess_window_s=self.reprocess_window_s,
                     reprocess_hold_ms=self.reprocess_hold_ms,
                     reprocess_max_wait_ms=self.reprocess_max_wait_ms,
+                    priority_preempt=self.priority_preempt,
                 )
             else:
                 self.generator = ExLlamaV2DynamicGeneratorAsync(

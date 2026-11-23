@@ -493,6 +493,7 @@ class ExLlamaV2ForkGeneratorAsync:
         reprocess_window_s: int = 300,
         reprocess_hold_ms: int = 5000,
         reprocess_max_wait_ms: int = 120000,
+        priority_preempt: bool = False,
     ):
         self.tokenizer = tokenizer
         # Append-only prompt cache (MP MTP): token ids whose K/V is live in the cache.
@@ -548,6 +549,7 @@ class ExLlamaV2ForkGeneratorAsync:
         self.reprocess_window_s = max(1, int(reprocess_window_s))
         self.reprocess_hold_ms = max(0, int(reprocess_hold_ms))
         self.reprocess_max_wait_ms = max(0, int(reprocess_max_wait_ms))
+        self.priority_preempt = bool(priority_preempt)
         self._reprocess_hits = {}
         if self.priority_queue:
             xlogger.info(
@@ -1893,11 +1895,12 @@ class ExLlamaV2ForkGeneratorAsync:
                 # Keep active jobs decoding during long prefills: stall <= one chunk.
                 if any(s.active for s in slots):
                     self._batch_decode_round_safe(slots, driver)
-                # Priority preemption: admit newly arrived SHORT jobs between chunks of
-                # a long prefill so they don't queue behind it (short prompts first).
-                # Single-chunk jobs only, nested admission without further preemption
-                # (pending=None) -> no recursion; _prefilling_job saved/restored.
-                if self.priority_queue and pending is not None:
+                # Priority preemption (opt-in priority_preempt): admit newly arrived
+                # SHORT jobs between chunks of a long prefill. EXPERIMENTAL: can crash
+                # the batch KV gather (negative shape) when rows admit mid-prefill;
+                # default off until root-caused. Single-chunk jobs only, nested
+                # admission without further preemption; _prefilling_job saved/restored.
+                if self.priority_queue and self.priority_preempt and pending is not None:
                     import queue as _tq
                     while True:
                         try:

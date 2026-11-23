@@ -385,6 +385,128 @@ class ModelConfig(BaseConfigModel):
         ),
     )
 
+    kv_cache_int8: Optional[bool] = Field(
+        False,
+        description=(
+            "INT8 KV cache shadow for plain decode (default: False = fp16).\n"
+            "ExllamaV2 ReadyArt fork only. Sets EXL2_KV_INT8. Ampere has no FP8, so\n"
+            "K/V are symmetric per-(token,head) INT8 with fp16 scales, dequantized\n"
+            "in-register by a custom flash-decode kernel — half the KV read bytes\n"
+            "for base (non-MTP) decode on the full-attention layers. The fp16 cache\n"
+            "remains primary (verify/prefill/SWA unchanged); the shadow adds ~50%\n"
+            "KV VRAM. MP backend, full layers only in this release."
+        ),
+    )
+    priority_queue: Optional[bool] = Field(
+        False,
+        description=(
+            "Shortest-prompt-first admission for MP+MTP multi-batch (default: False).\n"
+            "ExllamaV2 ReadyArt fork only, requires max_batch_size > 1. Large prefills\n"
+            "stall concurrent generation, so short prompts are admitted first and long\n"
+            "prompts last. A small batching window (batch_window_ms) collects arriving\n"
+            "short prompts so they can be admitted together into the batch slots.\n"
+            "priority_max_wait_ms ages long prompts forward to bound starvation.\n"
+            "Also enables the reprocess-abuse penalty (reprocess_* options)."
+        ),
+    )
+    batch_window_ms: Optional[int] = Field(
+        50,
+        description=(
+            "Micro-batch admission window in milliseconds (default: 50).\n"
+            "When priority_queue is on, an idle batch waits up to this long for more\n"
+            "arrivals before admitting, so short prompts arriving alongside a long\n"
+            "prompt go first and batch together. Keep small to avoid frustrating API\n"
+            "latency. 0 disables the window (pure shortest-first ordering)."
+        ),
+    )
+    batch_window_max_tokens: Optional[int] = Field(
+        4096,
+        description=(
+            "Prompt-length threshold for the batching window (default: 4096 tokens).\n"
+            "Prompts at or below this length are 'short' for scheduling purposes."
+        ),
+    )
+    priority_max_wait_ms: Optional[int] = Field(
+        30000,
+        description=(
+            "Starvation guard for priority_queue (default: 30000 ms).\n"
+            "A pending prompt that has waited longer than this is promoted ahead of\n"
+            "shorter prompts, so a continuous stream of short requests cannot block\n"
+            "a long prompt indefinitely."
+        ),
+    )
+    reprocess_min_tokens: Optional[int] = Field(
+        8192,
+        description=(
+            "Reprocess-abuse penalty threshold (default: 8192 tokens).\n"
+            "With priority_queue on, prompts at least this long that FULLY re-prefill\n"
+            "from scratch (cache miss — not a continuation or re-rendered last reply)\n"
+            "are tracked by prompt fingerprint. Repeated full reprocesses of the same\n"
+            "long document are deprioritized behind well-behaved traffic."
+        ),
+    )
+    reprocess_strikes: Optional[int] = Field(
+        2,
+        description=(
+            "Full-reprocess strikes before deprioritization (default: 2).\n"
+            "The first full prefill of a long document is normal; from this many full\n"
+            "reprocesses within reprocess_window_s, repeats of that fingerprint rank\n"
+            "last and are held briefly before admission."
+        ),
+    )
+    reprocess_window_s: Optional[int] = Field(
+        300,
+        description=(
+            "Strike counting window in seconds (default: 300).\n"
+            "Full-reprocess strikes older than this expire."
+        ),
+    )
+    reprocess_hold_ms: Optional[int] = Field(
+        5000,
+        description=(
+            "Admission hold for flagged reprocess abusers (default: 5000 ms).\n"
+            "Flagged prompts wait this long before admission so well-behaved arrivals\n"
+            "can jump ahead. reprocess_max_wait_ms overrides the hold."
+        ),
+    )
+    reprocess_max_wait_ms: Optional[int] = Field(
+        120000,
+        description=(
+            "Starvation guard for flagged abusers (default: 120000 ms).\n"
+            "Longer than priority_max_wait_ms — delays for abusers are intentional,\n"
+            "but they still eventually run."
+        ),
+    )
+    ngram_mode: Optional[str] = Field(
+        "disk",
+        description=(
+            "Engram (hashed n-gram embedding) table storage (default: disk).\n"
+            "ExllamaV2 ReadyArt fork only, for models with engram tables (e.g.\n"
+            "Qwen3.8-Flash-Next). 'disk': pread rows from the safetensors file on\n"
+            "SSD/NVMe per lookup (no host RAM cost). 'ram': full table resident in\n"
+            "host RAM (fastest, can be tens of GB). 'hybrid': disk + a bounded LRU\n"
+            "row cache in host RAM (ngram_hybrid_mb) — hot n-grams serve from RAM,\n"
+            "cold rows pread. Sets EXL2_NGRAM_MODE. Never resident in VRAM."
+        ),
+    )
+    ngram_hybrid_mb: Optional[int] = Field(
+        1024,
+        description=(
+            "Host-RAM budget for the hybrid ngram row cache in MB (default: 1024).\n"
+            "Only used when ngram_mode is 'hybrid'. Sets EXL2_NGRAM_HYBRID_MB."
+        ),
+    )
+    priority_preempt: Optional[bool] = Field(
+        False,
+        description=(
+            "EXPERIMENTAL mid-prefill preemption (default: False).\n"
+            "With priority_queue on, admit newly arrived short jobs between chunks of\n"
+            "a long prefill. Currently can crash the batch KV gather when rows admit\n"
+            "mid-prefill; leave off until root-caused. Without it, short prompts still\n"
+            "go ahead of PENDING long prompts and the reprocess penalty still applies."
+        ),
+    )
+
     _metadata: Metadata = PrivateAttr(Metadata())
     model_config = ConfigDict(protected_namespaces=())
 
@@ -502,117 +624,6 @@ class DraftModelConfig(BaseConfigModel):
             "per-step host round trips. Measured ~68 tok/s generation on\n"
             "Gemma-4-31B-IT (4x3090 200W cap, temp 1, draft_num_tokens 3, ~1.3k ctx).\n"
             "Eager drafting remains the fallback if capture fails."
-        ),
-    )
-    kv_cache_int8: Optional[bool] = Field(
-        False,
-        description=(
-            "INT8 KV cache shadow for plain decode (default: False = fp16).\n"
-            "ExllamaV2 ReadyArt fork only. Sets EXL2_KV_INT8. Ampere has no FP8, so\n"
-            "K/V are symmetric per-(token,head) INT8 with fp16 scales, dequantized\n"
-            "in-register by a custom flash-decode kernel — half the KV read bytes\n"
-            "for base (non-MTP) decode on the full-attention layers. The fp16 cache\n"
-            "remains primary (verify/prefill/SWA unchanged); the shadow adds ~50%\n"
-            "KV VRAM. MP backend, full layers only in this release."
-        ),
-    )
-    priority_queue: Optional[bool] = Field(
-        False,
-        description=(
-            "Shortest-prompt-first admission for MP+MTP multi-batch (default: False).\n"
-            "ExllamaV2 ReadyArt fork only, requires max_batch_size > 1. Large prefills\n"
-            "stall concurrent generation, so short prompts are admitted first and long\n"
-            "prompts last. A small batching window (batch_window_ms) collects arriving\n"
-            "short prompts so they can be admitted together into the batch slots.\n"
-            "priority_max_wait_ms ages long prompts forward to bound starvation."
-        ),
-    )
-    batch_window_ms: Optional[int] = Field(
-        50,
-        description=(
-            "Micro-batch admission window in milliseconds (default: 50).\n"
-            "When priority_queue is on and a SHORT prompt arrives to an idle batch,\n"
-            "wait up to this long for more short prompts before admitting, so they\n"
-            "batch together. Keep small to avoid frustrating API latency. 0 disables\n"
-            "the window (pure shortest-first ordering)."
-        ),
-    )
-    batch_window_max_tokens: Optional[int] = Field(
-        4096,
-        description=(
-            "Prompt-length threshold for the batching window (default: 4096 tokens).\n"
-            "Only prompts at or below this length trigger the collection window;\n"
-            "longer prompts are admitted immediately (and ranked last)."
-        ),
-    )
-    priority_max_wait_ms: Optional[int] = Field(
-        30000,
-        description=(
-            "Starvation guard for priority_queue (default: 30000 ms).\n"
-            "A pending prompt that has waited longer than this is promoted ahead of\n"
-            "shorter prompts, so a continuous stream of short requests cannot block\n"
-            "a long prompt indefinitely."
-        ),
-    )
-    reprocess_min_tokens: Optional[int] = Field(
-        8192,
-        description=(
-            "Reprocess-abuse penalty threshold (default: 8192 tokens).\n"
-            "With priority_queue on, prompts at least this long that FULLY re-prefill\n"
-            "from scratch (cache miss — not a continuation or re-rendered last reply)\n"
-            "are tracked by prompt fingerprint. Repeated full reprocesses of the same\n"
-            "long document are deprioritized behind well-behaved traffic."
-        ),
-    )
-    reprocess_strikes: Optional[int] = Field(
-        2,
-        description=(
-            "Full-reprocess strikes before deprioritization (default: 2).\n"
-            "The first full prefill of a long document is normal; from this many full\n"
-            "reprocesses within reprocess_window_s, repeats of that fingerprint rank\n"
-            "last and are held briefly before admission."
-        ),
-    )
-    reprocess_window_s: Optional[int] = Field(
-        300,
-        description=(
-            "Strike counting window in seconds (default: 300).\n"
-            "Full-reprocess strikes older than this expire."
-        ),
-    )
-    reprocess_hold_ms: Optional[int] = Field(
-        5000,
-        description=(
-            "Admission hold for flagged reprocess abusers (default: 5000 ms).\n"
-            "Flagged prompts wait this long before admission so well-behaved arrivals\n"
-            "can jump ahead. reprocess_max_wait_ms overrides the hold."
-        ),
-    )
-    reprocess_max_wait_ms: Optional[int] = Field(
-        120000,
-        description=(
-            "Starvation guard for flagged abusers (default: 120000 ms).\n"
-            "Longer than priority_max_wait_ms — delays for abusers are intentional,\n"
-            "but they still eventually run."
-        ),
-    )
-    ngram_mode: Optional[str] = Field(
-        "disk",
-        description=(
-            "Engram (hashed n-gram embedding) table storage (default: disk).\n"
-            "ExllamaV2 ReadyArt fork only, for models with engram tables (e.g.\n"
-            "Qwen3.8-Flash-Next). 'disk': pread rows from the safetensors file on\n"
-            "SSD/NVMe per lookup (no host RAM cost). 'ram': full table resident in\n"
-            "host RAM (fastest, can be tens of GB). 'hybrid': disk + a bounded LRU\n"
-            "row cache in host RAM (ngram_hybrid_mb) — hot n-grams serve from RAM,\n"
-            "cold rows pread. Sets EXL2_NGRAM_MODE. Never resident in VRAM."
-        ),
-    )
-    ngram_hybrid_mb: Optional[int] = Field(
-        1024,
-        description=(
-            "Host-RAM budget for the hybrid ngram row cache in MB (default: 1024).\n"
-            "Only used when ngram_mode is 'hybrid'. Sets EXL2_NGRAM_HYBRID_MB."
         ),
     )
 
