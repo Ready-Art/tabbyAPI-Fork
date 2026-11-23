@@ -283,6 +283,12 @@ class ExllamaV2Container(BaseModelContainer):
                         os.environ["EXL2_MTP_DRAFT_GRAPH"] = (
                             "1" if unwrap(draft_args.get("mtp_draft_graph"), False) else "0"
                         )
+                        os.environ["EXL2_MTP_INT8_W"] = (
+                            "1" if unwrap(draft_args.get("mtp_int8_weights"), False) else "0"
+                        )
+                        os.environ["EXL2_MTP_INT8_KV"] = (
+                            "1" if unwrap(draft_args.get("mtp_int8_kv"), False) else "0"
+                        )
                     xlogger.info(
                         f"{'DFlash' if self.use_dflash else 'MTP'} drafting enabled: "
                         f"{self.draft_model_dir} "

@@ -630,6 +630,29 @@ class DraftModelConfig(BaseConfigModel):
             "Eager drafting remains the fallback if capture fails."
         ),
     )
+    mtp_int8_weights: Optional[bool] = Field(
+        False,
+        description=(
+            "INT8 weight-only MTP drafter GEMVs (default: False). Sets EXL2_MTP_INT8_W.\n"
+            "ExllamaV2 ReadyArt fork only. Per-output-row symmetric INT8 + fp16 scales,\n"
+            "custom CUDA GEMV kernel (no Triton); halves the drafter's weight-read\n"
+            "bandwidth (the m=1 GEMV floor). Draft tokens shift slightly (quantization\n"
+            "error) -- speculative acceptance keeps the OUTPUT distribution exact;\n"
+            "only the acceptance rate can move. fp16 weights are kept for the sparse\n"
+            "head rebuild + fallback."
+        ),
+    )
+    mtp_int8_kv: Optional[bool] = Field(
+        False,
+        description=(
+            "INT8 MTP KV shadow (default: False). Sets EXL2_MTP_INT8_KV.\n"
+            "ExllamaV2 ReadyArt fork only. The drafter's gathered FULL-layer target\n"
+            "K/V shadow gets an INT8 copy (per-(token,head) scales) read by the int8\n"
+            "flash-decode kernel -- halves the long-context cross-attention KV read.\n"
+            "SWA rings stay fp16. Adds ~50% of the full-layer shadow VRAM on the draft\n"
+            "device. Independent of the target's kv_cache_int8."
+        ),
+    )
 
 
 class SamplingConfig(BaseConfigModel):
