@@ -77,7 +77,7 @@ def _compose_response(
     """
 
     choices = []
-    for generation in generations:
+    for i, generation in enumerate(generations):
         message = ChatCompletionMessage(
             role="assistant",
             content=generation.get("content") or None,
@@ -85,9 +85,13 @@ def _compose_response(
             tool_calls=generation.get("tool_calls") or None,
         )
 
+        # An aborted/disconnected generation may carry no "index" (None); the response
+        # choice index is required to be an int, so fall back to the choice position
+        # instead of crashing pydantic validation (debug50.txt).
+        _idx = generation.get("index")
         choices.append(
             ChatCompletionRespChoice(
-                index=generation.get("index"),
+                index=_idx if _idx is not None else i,
                 finish_reason=generation.get("finish_reason", "stop"),
                 eos_reason=generation.get("eos_reason"),
                 stop_str=generation.get("stop_str"),
