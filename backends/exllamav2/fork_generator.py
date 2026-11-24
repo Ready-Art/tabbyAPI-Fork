@@ -2050,6 +2050,11 @@ class ExLlamaV2ForkGeneratorAsync:
                 f"(the per-chunk [prefill] trace resets its denominator each call; "
                 f"this counter is the cumulative progress)"
             )
+        # INT8-primary KV: open the fp16 prefill staging for this row on every
+        # rank. Each chunk quantizes into the INT8 primary as it lands, so the
+        # decode rounds interleaved below read consistent INT8; the staging is
+        # freed in the finally (also on abort). No-op when INT8 KV is off.
+        pg.prefill_staging_begin(r, pg.cache.seq_lens[r] + n)
         try:
             while pos < n:
                 if job.abort_event.is_set():
@@ -2127,6 +2132,7 @@ class ExLlamaV2ForkGeneratorAsync:
         finally:
             self._prefilling_job = None
             pg.abort_flag.clear()
+            pg.prefill_staging_end(r)
         time_prefill = time.perf_counter() - time_start
 
         if aborted or logits is None:

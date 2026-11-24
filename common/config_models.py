@@ -388,13 +388,16 @@ class ModelConfig(BaseConfigModel):
     kv_cache_int8: Optional[bool] = Field(
         False,
         description=(
-            "INT8 KV cache shadow for plain decode (default: False = fp16).\n"
+            "INT8 PRIMARY KV cache (default: False = fp16).\n"
             "ExllamaV2 ReadyArt fork only. Sets EXL2_KV_INT8. Ampere has no FP8, so\n"
-            "K/V are symmetric per-(token,head) INT8 with fp16 scales, dequantized\n"
-            "in-register by a custom flash-decode kernel — half the KV read bytes\n"
-            "for base (non-MTP) decode on the full-attention layers. The fp16 cache\n"
-            "remains primary (verify/prefill/SWA unchanged); the shadow adds ~50%\n"
-            "KV VRAM. MP backend, full layers only in this release."
+            "K/V are symmetric per-(token,head) INT8 with fp16 scales, read by a\n"
+            "custom multi-warp split-KV attention kernel (decode AND MTP verify).\n"
+            "INT8 is the ONLY full-depth KV storage on the full-attention layers —\n"
+            "no fp16 shadow alongside — halving KV VRAM (~-50% vs fp16). fp16\n"
+            "full-depth buffers exist only as transient prefill staging (freed when\n"
+            "prefill ends); SWA rings stay fp16. With MTP, the drafter's joined KV\n"
+            "shadow goes INT8 too (half the gather pipe bytes). MP backend, full\n"
+            "layers with head_dim 256/512; models with logit softcapping stay fp16."
         ),
     )
     moe_offload_experts: Optional[int] = Field(

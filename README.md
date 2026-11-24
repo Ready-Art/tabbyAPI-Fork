@@ -201,7 +201,8 @@ multi-batch** opt-in via `max_batch_size` on MP + MTP, validated under concurren
 prompt-cache RAM offload** opt-in via `prompt_cache_offload` + `prompt_cache_ram_limit_mb`,
 tiering idle conversations to host RAM under a **whole-server** byte cap so the VRAM context
 budget is not a hard limit on cached conversations when sharing the API; **INT8 KV cache**
-opt-in via `kv_cache_int8` (default fp16) halving long-context decode KV reads; **priority
+opt-in via `kv_cache_int8` (default fp16) — INT8-primary storage (no fp16 shadow) halving
+KV VRAM and long-context decode/verify KV reads; **priority
 prompt scheduler** opt-in via `priority_queue` — shortest-first admission plus a
 reprocess-abuse penalty for shared-API serving; **engram storage modes** `ngram_mode`
 disk/ram/hybrid for n-gram models; full-sampler
