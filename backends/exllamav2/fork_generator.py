@@ -288,6 +288,102 @@ def _prefix_match_len(ids_cpu, cached, m):
     return int(diff[0]) if diff.numel() else m
 
 
+_CENSUS_PREV = {}
+
+
+def _tensor_census(dev, top = 14):
+    """EXL2_VRAM_CENSUS: live CUDA tensors on one device grouped by (dtype, storage
+    bytes), deduped by storage so views are not double-counted. A leak shows up as a
+    growing COUNT of same-sized storages across job boundaries; a grow-only buffer
+    shows up as growing storage bytes. Returns (total_bytes, [(dtype, nbytes, count,
+    rep_shape), ...]) sorted by aggregate size."""
+    import gc
+    from collections import defaultdict
+    stor = {}
+    for o in gc.get_objects():
+        if not torch.is_tensor(o) or not o.is_cuda or o.device.index != dev:
+            continue
+        try:
+            s = o.untyped_storage()
+            p = s.data_ptr()
+        except Exception:
+            continue
+        if p and p not in stor:
+            stor[p] = (str(o.dtype), s.nbytes(), tuple(o.shape))
+    agg = defaultdict(lambda: [0, 0, None])
+    for dt, nb, shp in stor.values():
+        a = agg[(dt, nb)]
+        a[0] += 1
+        a[1] += nb
+        a[2] = shp
+    rows = sorted(agg.items(), key = lambda kv: -kv[1][1])[:top]
+    total = sum(v[1] for v in agg.values())
+    flat = {k: (v[0], v[1], v[2]) for k, v in agg.items()}
+    return total, [(dt, nb, cnt, shp) for (dt, nb), (cnt, _tot, shp) in rows], flat
+
+
+def _worker_tensor_census(ctx):
+    """Per-rank tensor census for EXL2_VRAM_CENSUS (runs via the 'exec' command)."""
+    return _tensor_census(torch.cuda.current_device())
+
+
+def _ref_chain(t, depth = 7):
+    """EXL2_VRAM_REFS: walk gc referrers from a live tensor to its owner, printing
+    dict keys / container sizes / module identity so a retained buffer can be
+    attributed to the exact cache that holds it."""
+    import gc
+    import types
+    skip = (types.FrameType, types.FunctionType, types.GeneratorType,
+            type(iter([])), type(iter(())))
+    out = []
+    cur = t
+    seen = {id(t)}
+    for _ in range(depth):
+        refs = []
+        for r in gc.get_referrers(cur):
+            if id(r) in seen or isinstance(r, skip):
+                continue
+            # gc.get_objects() itself references every tracked object -- exclude it
+            # (and any other census-sized list) or the chain dead-ends in the probe.
+            if isinstance(r, (list, tuple)) and len(r) > 20000:
+                continue
+            refs.append(r)
+        if not refs:
+            break
+        refs.sort(key = lambda r: 0 if isinstance(r, dict)
+                  else 2 if isinstance(r, (list, tuple, set)) else 1)
+        r = refs[0]
+        seen.add(id(r))
+        if isinstance(r, dict):
+            ks = [k for k, v in r.items() if v is cur]
+            out.append(f"dict{ks[:3]}")
+        elif isinstance(r, (list, tuple, set)):
+            out.append(f"{type(r).__name__}[{len(r)}]")
+        else:
+            extra = ""
+            for a in ("layer_idx", "key", "out_features", "in_features"):
+                if hasattr(r, a):
+                    extra += f" {a}={getattr(r, a)}"
+            out.append(type(r).__name__ + extra)
+        cur = r
+    return " <- ".join(out)
+
+
+def _census_refs(dev, shapes):
+    """One referrer chain per requested shape (first live tensor found)."""
+    import gc
+    want = {tuple(s) for s in shapes}
+    found = {}
+    for o in gc.get_objects():
+        if torch.is_tensor(o) and o.is_cuda and o.device.index == dev:
+            s = tuple(o.shape)
+            if s in want and s not in found:
+                found[s] = _ref_chain(o)
+                if len(found) == len(want):
+                    break
+    return found
+
+
 def _worker_vram_stats(ctx):
     """Per-rank allocator stats for EXL2_VRAM_WATCH (runs via the 'exec' command)."""
     d = torch.cuda.current_device()
@@ -750,6 +846,51 @@ class ExLlamaV2ForkGeneratorAsync:
                 lines.append(f"[vram-watch]   cold store="
                              f"{self._cold_store.total / 2**20:.0f} MB / "
                              f"{len(self._cold_store.entries)} entries")
+            if os.environ.get("EXL2_VRAM_CENSUS", "0") == "1":
+                tot, rows, flat = _tensor_census(0, top = 24)
+                lines.append(f"[census] master dev0 live={tot / 2**20:.0f} MiB "
+                             f"(allocator {torch.cuda.memory_allocated(0) / 2**20:.0f}) "
+                             f"storages={len(flat)}")
+                for dt, nb, cnt, shp in rows:
+                    lines.append(f"[census]   {dt} {nb / 2**20:.1f} MiB x{cnt} "
+                                 f"= {cnt * nb / 2**20:.0f} MiB shape={shp}")
+                prev = _CENSUS_PREV.get("master")
+                if prev is not None:
+                    deltas = []
+                    for k, (cnt, agg, shp) in flat.items():
+                        pc, pa, _ = prev.get(k, (0, 0, None))
+                        if cnt != pc or agg != pa:
+                            deltas.append((agg - pa, k[0], k[1], cnt - pc, cnt, shp))
+                    deltas.sort(key = lambda d: -abs(d[0]))
+                    for dagg, dt, nb, dcnt, cnt, shp in deltas[:14]:
+                        lines.append(f"[census-delta] {dt} {nb / 2**20:.2f} MiB "
+                                     f"d_count={dcnt:+d} now_x{cnt} "
+                                     f"d_MiB={dagg / 2**20:+.1f} shape={shp}")
+                    if os.environ.get("EXL2_VRAM_REFS", "0") == "1":
+                        big = [d[5] for d in deltas
+                               if d[0] > 0 and len(d[5]) == 2 and d[5][0] > 32][:6]
+                        for shp, chain in _census_refs(0, big).items():
+                            lines.append(f"[census-refs] shape={shp} {chain}")
+                _CENSUS_PREV["master"] = flat
+                for dev, w in sorted(pg.workers.items()):
+                    w.send("exec", (_worker_tensor_census, ()))
+                for dev, w in sorted(pg.workers.items()):
+                    wt, wrows, wflat = w.recv()
+                    lines.append(f"[census] rank{dev} live={wt / 2**20:.0f} MiB "
+                                 f"storages={len(wflat)}")
+                    wp = _CENSUS_PREV.get(dev)
+                    if wp is not None:
+                        wd = []
+                        for k, (cnt, agg, shp) in wflat.items():
+                            pc, pa, _ = wp.get(k, (0, 0, None))
+                            if cnt != pc or agg != pa:
+                                wd.append((agg - pa, k[0], k[1], cnt - pc, cnt, shp))
+                        wd.sort(key = lambda d: -abs(d[0]))
+                        for dagg, dt, nb, dcnt, cnt, shp in wd[:8]:
+                            lines.append(f"[census-delta] rank{dev} {dt} "
+                                         f"{nb / 2**20:.2f} MiB d_count={dcnt:+d} "
+                                         f"now_x{cnt} d_MiB={dagg / 2**20:+.1f} shape={shp}")
+                    _CENSUS_PREV[dev] = wflat
             xlogger.info("\n".join(lines))
         except Exception as e:
             xlogger.warning(f"[vram-watch] failed: {type(e).__name__}: {e}")
