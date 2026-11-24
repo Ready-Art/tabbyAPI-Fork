@@ -1152,6 +1152,24 @@ class ExllamaV2Container(BaseModelContainer):
                 # Immediately cancel all jobs
                 await self.wait_for_jobs(skip_wait=True)
 
+            # Tear down the OLD generator before replacing it (crash.txt CRASH 2):
+            # its scheduler task and job/driver references must drop while the MP
+            # workers are still alive -- worker-shared (shm) tensors freed later on
+            # the event loop abort the process ("could not unlink the shared memory
+            # file"). close() aborts jobs and stops the scheduler; the tp_group and
+            # workers are shared with the new generator and stay up.
+            old_gen = getattr(self, "generator", None)
+            if old_gen is not None:
+                _close = getattr(old_gen, "close", None)
+                if _close is not None:
+                    try:
+                        await _close()
+                    except Exception as e:
+                        xlogger.warning(f"Old generator close failed: {e}")
+                self.generator = None
+                import gc
+                gc.collect()
+
             # Create new generator
             if self.fork_mode:
                 # Fork TP/MTP paths: streaming-generator-based async wrapper

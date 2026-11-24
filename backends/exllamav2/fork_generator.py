@@ -288,6 +288,21 @@ def _prefix_match_len(ids_cpu, cached, m):
     return int(diff[0]) if diff.numel() else m
 
 
+def _worker_vram_stats(ctx):
+    """Per-rank allocator stats for EXL2_VRAM_WATCH (runs via the 'exec' command)."""
+    d = torch.cuda.current_device()
+    m = ctx.get("model")
+    tg = getattr(m, "tp_graph", None)
+    c = getattr(m, "tp_context", None)
+    return (
+        torch.cuda.memory_allocated(d) / 2**20,
+        torch.cuda.memory_reserved(d) / 2**20,
+        len(tg.runners) if tg is not None else -1,
+        (len(c.fi_decode), len(c.fi_prefill), len(c.fi_decode_rows))
+        if c is not None else (-1, -1, -1),
+    )
+
+
 class _ColdPromptStore:
     """Host-RAM tier of the MP+MTP prompt cache (opt-in, EXPERIMENTAL).
 
@@ -674,6 +689,54 @@ class ExLlamaV2ForkGeneratorAsync:
         except asyncio.CancelledError:
             pass
 
+    def _vram_watch(self, tag):
+        """Opt-in (EXL2_VRAM_WATCH=1) VRAM accounting: device-wide usage per GPU,
+        per-rank allocator allocated/reserved (leak vs fragmentation), graph/FI
+        wrapper counts and cold-store size. Localizes steady VRAM growth."""
+        if os.environ.get("EXL2_VRAM_WATCH", "0") != "1":
+            return
+        try:
+            pg = self.tp_group
+            nd = torch.cuda.device_count()
+            used = []
+            for d in range(nd):
+                f, t = torch.cuda.mem_get_info(d)
+                used.append((t - f) / 2**20)
+            lines = [f"[vram-watch] {tag} dev_used_MiB="
+                     + ",".join(f"{u:.0f}" for u in used)]
+            ma = [torch.cuda.memory_allocated(d) / 2**20 for d in range(nd)]
+            mr = [torch.cuda.memory_reserved(d) / 2**20 for d in range(nd)]
+            lines.append("[vram-watch]   master alloc/reserved MiB="
+                         + ",".join(f"{a:.0f}/{r:.0f}" for a, r in zip(ma, mr)))
+            for dev, w in sorted(pg.workers.items()):
+                w.send("exec", (_worker_vram_stats, ()))
+            for dev, w in sorted(pg.workers.items()):
+                a, r, ng, fi = w.recv()
+                lines.append(f"[vram-watch]   rank{dev} alloc/reserved MiB={a:.0f}/{r:.0f} "
+                             f"graphs={ng} fi(d/p/r)={fi[0]}/{fi[1]}/{fi[2]}")
+            model = getattr(pg, "model", None)
+            tg = getattr(model, "tp_graph", None)
+            ctx = getattr(model, "tp_context", None)
+            if tg is not None:
+                lines.append(f"[vram-watch]   master graphs={list(tg.runners.keys())}")
+            if ctx is not None:
+                lines.append(f"[vram-watch]   master fi(d/p/r)="
+                             f"{len(ctx.fi_decode)}/{len(ctx.fi_prefill)}/{len(ctx.fi_decode_rows)}")
+            d = self.mtp_drafter
+            if d is not None:
+                sp = getattr(d, "sparse", None)
+                spn = None if sp is None or sp.subset is None else sp.subset.shape[0]
+                lines.append(f"[vram-watch]   draft graph={d._draft_graph is not None} "
+                             f"b_graphs={list(getattr(d, '_b_graphs', {}).keys())} "
+                             f"sparse_cols={spn}")
+            if self._cold_store is not None:
+                lines.append(f"[vram-watch]   cold store="
+                             f"{self._cold_store.total / 2**20:.0f} MB / "
+                             f"{len(self._cold_store.entries)} entries")
+            xlogger.info("\n".join(lines))
+        except Exception as e:
+            xlogger.warning(f"[vram-watch] failed: {type(e).__name__}: {e}")
+
     # ------------------------------------------------------------------ job execution
 
     def _put(self, job, result):
@@ -956,6 +1019,7 @@ class ExLlamaV2ForkGeneratorAsync:
         ids_cpu = job.input_ids.cpu()
         self._job_prompt_ids = ids_cpu
         n_prompt = ids_cpu.shape[-1]
+        self._vram_watch(f"scalar job n={n_prompt}")
         cached = self._cached_ids if self._cache_valid else None
         reuse = False
         restored = False
@@ -1054,7 +1118,17 @@ class ExLlamaV2ForkGeneratorAsync:
                             start = 0
                             kind = "cold restore (reset)"
                         if n_prompt <= start:
-                            start -= 1   # exact-match prompt: rewrite the last token
+                            # Exact-match prompt: rewrite the last token. Prefill
+                            # APPENDS at current_seq_len, so the cache must sit AT
+                            # start (p-1), not p -- truncating to p left it one token
+                            # past the prompt -> commit_base "beyond tracked tokens"
+                            # (crash.txt CRASH 1). Below the ring origin: full reset.
+                            start -= 1
+                            if start >= pg.cache.window_beg:
+                                pg.truncate_cache(start)
+                            else:
+                                pg.mtp_reset_cache()
+                                start = 0
                         prefill_ids = ids_cpu[:, start:]
                         cold_partial = True   # cold path decided; skip the hot block
                         dt = (time.perf_counter() - t0) * 1000
@@ -1149,10 +1223,14 @@ class ExLlamaV2ForkGeneratorAsync:
             m = min(cached.shape[-1], n_prompt)
             match = _prefix_match_len(ids_cpu, cached, m)
             p = min(match, self._cached_pos)
-            if match >= min_len and p > 0 and p >= pg.cache.window_beg:
+            start_p = p if n_prompt > p else p - 1
+            if match >= min_len and p > 0 and start_p >= pg.cache.window_beg:
                 self._offload_scalar_lineage()
-                pg.truncate_cache(p)
-                start = p if n_prompt > p else p - 1
+                # Rewind to the ACTUAL prefill start: prefill appends at
+                # current_seq_len, so the exact-match last-token rewrite (start=p-1)
+                # must truncate to p-1, not p (crash.txt CRASH 1 off-by-one).
+                pg.truncate_cache(start_p)
+                start = start_p
                 prefill_ids = ids_cpu[:, start:]
                 partial_scalar = True
                 xlogger.info(
@@ -1235,6 +1313,8 @@ class ExLlamaV2ForkGeneratorAsync:
             tok = int(driver.step(settings, self.tokenizer, seq_ids, ban_tokens=ban))
             all_ids.append(tok)
             new_tokens += 1
+            if new_tokens % 256 == 0:
+                self._vram_watch(f"scalar {new_tokens} tok")
             seq_ids = torch.cat([seq_ids, torch.tensor([[tok]], dtype=torch.long)], dim=-1)
 
             if tok in stop_tokens:
@@ -1508,6 +1588,9 @@ class ExLlamaV2ForkGeneratorAsync:
                 })
 
     def _batch_decode_round_safe(self, slots, driver):
+        self._watch_rounds = getattr(self, "_watch_rounds", 0) + 1
+        if self._watch_rounds % 100 == 0:
+            self._vram_watch(f"round {self._watch_rounds}")
         try:
             self._batch_decode_round(slots, driver)
         except Exception as e:
@@ -1637,6 +1720,7 @@ class ExLlamaV2ForkGeneratorAsync:
         pg = self.tp_group
         ids_cpu = job.input_ids.cpu()
         n_prompt = ids_cpu.shape[-1]
+        self._vram_watch(f"admit slot {r} n={n_prompt}")
         cached = slot.cached_ids if slot.cache_valid else None
         reuse = False
         restored = False
@@ -1702,7 +1786,8 @@ class ExLlamaV2ForkGeneratorAsync:
                 m = min(clen, n_prompt)
                 match = _prefix_match_len(ids_cpu, slot.cached_ids, m)
                 p = min(match, slot.cached_pos)
-                if match >= min_len and 0 < p >= pg.cache.window_begs[r]:
+                if (match >= min_len and 0 < p >= pg.cache.window_begs[r]
+                        and (n_prompt > p or p - 1 >= pg.cache.window_begs[r])):
                     p_own = p
             # Candidate 2 -- shared-prefix clone from another HOT slot: concurrent
             # requests commonly share a long system / few-shot / document prefix, and
@@ -1726,11 +1811,14 @@ class ExLlamaV2ForkGeneratorAsync:
                 best_p = p_own if p_own > 0 else p_clone
             if best_p > 0 and best_p == p_own:
                 self._offload_slot(slot, r)
-                pg.truncate_row(r, p_own)
                 # Exact-match prompt (n_prompt == p): rewrite the last token instead
                 # of an empty prefill (idempotent KV rewrite; an empty suffix would
-                # leave logits None and abort the job).
+                # leave logits None and abort the job). The rewind must land AT the
+                # prefill start: prefill appends at seq_lens[r], so truncating to p
+                # while prefilling from p-1 left the row one token past the prompt
+                # (crash.txt CRASH 1 off-by-one).
                 start = p_own if n_prompt > p_own else p_own - 1
+                pg.truncate_row(r, start)
                 prefill_ids = ids_cpu[:, start:]
                 partial = True
                 slot.hits += 1
@@ -1741,8 +1829,11 @@ class ExLlamaV2ForkGeneratorAsync:
             elif best_p > 0 and best_p == p_clone:
                 self._offload_slot(slot, r)
                 i, p = src
-                pg.clone_row(i, r, p)
+                # Clone to the ACTUAL prefill start (the exact-match last-token
+                # rewrite clones p-1 rows; _clone_source guarantees p > src ring
+                # origin, so p-1 stays inside it). Same off-by-one as truncate.
                 start = p if n_prompt > p else p - 1
+                pg.clone_row(i, r, start)
                 prefill_ids = ids_cpu[:, start:]
                 cloned = True
                 xlogger.info(
@@ -1824,7 +1915,15 @@ class ExLlamaV2ForkGeneratorAsync:
                     restored_pos = cpos
                     dt = (time.perf_counter() - t0) * 1000
                     if n_prompt <= start:
-                        start -= 1   # exact-match prompt: rewrite the last token
+                        # Exact-match last-token rewrite: land the row AT start
+                        # (prefill appends at seq_lens[r]); below the ring origin
+                        # falls back to a full reset. crash.txt CRASH 1 off-by-one.
+                        start -= 1
+                        if start >= pg.cache.window_begs[r]:
+                            pg.truncate_row(r, start)
+                        else:
+                            pg.mtp_reset_row(r)
+                            start = 0
                     prefill_ids = ids_cpu[:, start:]
                     cold_restored = True
                     self._cold_store.n_restore += 1
