@@ -1162,8 +1162,20 @@ class ExllamaV2Container(BaseModelContainer):
             if old_gen is not None:
                 _close = getattr(old_gen, "close", None)
                 if _close is not None:
+                    # BOUNDED teardown. close() awaits the old scheduler task; if that
+                    # scheduler is stuck on a dead/stalled worker (exactly when a fatal
+                    # triggers recreation) an unbounded await wedges recreation forever
+                    # -> every later request queues until the client times out and
+                    # disconnects (0-token aborts). The original code never waited.
+                    # shield() keeps close() running on timeout (so it still stops the
+                    # scheduler / frees shm refs) without blocking the new generator.
                     try:
-                        await _close()
+                        await asyncio.wait_for(asyncio.shield(_close()), timeout=10)
+                    except asyncio.TimeoutError:
+                        xlogger.warning(
+                            "Old generator close timed out (stuck scheduler?); "
+                            "continuing recreation, teardown finishes in background."
+                        )
                     except Exception as e:
                         xlogger.warning(f"Old generator close failed: {e}")
                 self.generator = None
