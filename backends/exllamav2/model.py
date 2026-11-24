@@ -68,6 +68,16 @@ except ImportError:
     ExLlamaV2Cache_SWA = None
 
 try:
+    from exllamav2.cache import ExLlamaV2Cache_Hybrid
+except ImportError:
+    ExLlamaV2Cache_Hybrid = None
+
+try:
+    from exllamav2.mtp_qwen35 import Qwen35MTPDrafter
+except ImportError:
+    Qwen35MTPDrafter = None
+
+try:
     from exllamav2.mtp_drafter import Gemma4AssistantDrafter
     from exllamav2.tp_mp import TPProcessGroup
 except ImportError:
@@ -186,6 +196,10 @@ class ExllamaV2Container(BaseModelContainer):
         # Check if the model arch is compatible with various exl2 features
         self.config.arch_compat_overrides()
 
+        # Hybrid linear-attention backbone (Qwen3.5 / Qwen3.8): gated delta net +
+        # full attention, needs the fork's hybrid cache. newplan.md P6 (experimental).
+        self.is_hybrid = getattr(self.config, "hybrid_linear_attn", False)
+
         # Sliding-window attention (e.g. Gemma-4) needs the fork's SWA ring cache
         self.is_swa = getattr(self.config, "sliding_window", 0) > 0
         if self.is_swa and ExLlamaV2Cache_SWA is None:
@@ -225,7 +239,17 @@ class ExllamaV2Container(BaseModelContainer):
         # one parallel pass). Both ride the same verify/accept round protocol.
         self.use_mtp = draft_mode in ("mtp", "dflash")
         self.use_dflash = draft_mode == "dflash"
-        if self.use_mtp:
+        # Built-in MTP (Qwen3.5 / Qwen3.8, experimental): the drafter is a single
+        # decoder layer shipped inside the target checkpoint (mtp.* tensors), so no
+        # draft_model_name is needed. Rides the same verify/accept round protocol.
+        self.use_builtin_mtp = False
+        if self.use_mtp and not draft_model_name and \
+                getattr(self.config.arch.lm, "builtin_mtp", False):
+            self.use_builtin_mtp = True
+            xlogger.info(
+                "Using the model's built-in MTP drafter (experimental, greedy decoding only)."
+            )
+        elif self.use_mtp:
             if not draft_model_name:
                 raise ValueError(
                     "draft_mode 'mtp'/'dflash' requires draft_model_name "
@@ -488,6 +512,17 @@ class ExllamaV2Container(BaseModelContainer):
                 xlogger.info(
                     "Sliding-window model: using the streaming generation path "
                     "(batch size 1) for verified SWA ring handling."
+                )
+            self.fork_mode = True
+
+        # Hybrid linear-attention models use the streaming wrapper: the paged dynamic
+        # generator has no GDN-state protocol, while the streaming path's per-job fresh
+        # prefill + single-token rewind backup is verified for the delta net. P6.
+        if self.is_hybrid and not self.use_tp:
+            if not self.fork_mode:
+                xlogger.info(
+                    "Hybrid linear-attention model: using the streaming generation path "
+                    "(batch size 1)."
                 )
             self.fork_mode = True
 
@@ -970,6 +1005,12 @@ class ExllamaV2Container(BaseModelContainer):
         cache_class = self.get_cache_class(self.cache_mode)
         if self.is_swa and ExLlamaV2Cache_SWA is not None:
             cache_class = ExLlamaV2Cache_SWA
+        # Hybrid linear-attention backbone needs the GDN-state cache. newplan.md P6.
+        if self.is_hybrid:
+            cache_class = ExLlamaV2Cache_Hybrid
+            if self.cache_mode != "FP16":
+                xlogger.warning("Hybrid models support FP16 cache only; forcing FP16.")
+                self.cache_mode = "FP16"
 
         if self.tp_backend == "mp" and self.use_tp:
             # Multiprocess TP (ReadyArt fork): one worker process per GPU.
@@ -990,7 +1031,8 @@ class ExllamaV2Container(BaseModelContainer):
                 gpu_split,
                 max_seq_len=self.config.max_seq_len,
                 cache_tokens=self.cache_size,
-                cache_base_name="ExLlamaV2Cache_SWA" if self.is_swa else "ExLlamaV2Cache",
+                cache_base_name="ExLlamaV2Cache_Hybrid" if self.is_hybrid
+                else ("ExLlamaV2Cache_SWA" if self.is_swa else "ExLlamaV2Cache"),
                 max_batch=self.max_batch_size if self.use_mtp else 1,
                 max_input_len=self.config.max_input_len,
             )
@@ -1062,7 +1104,39 @@ class ExllamaV2Container(BaseModelContainer):
         # Fork drafter (ReadyArt): single-device model in the parent process.
         # MTP assistant cross-attends to the target's K/V (single-GPU, SP, MP);
         # DFlash conditions on the target's aux hidden states (MP only).
-        if self.use_mtp:
+        if self.use_builtin_mtp:
+            # Built-in MTP (Qwen3.5, experimental): drafter weights live in the target
+            # checkpoint; single-process only for now (MP fan-out of the GDN verify
+            # staging is a follow-up). Greedy decoding only.
+            if self.tp_group is not None or self.use_tp:
+                xlogger.warning(
+                    "Built-in MTP (experimental) supports single-GPU / autosplit only; "
+                    "disabling drafting for TP/MP."
+                )
+                self.use_mtp = False
+                self.use_builtin_mtp = False
+                self.mtp_drafter = None
+            elif Qwen35MTPDrafter is None:
+                xlogger.warning("Built-in MTP requires the ReadyArt exllamav2 fork. Disabling.")
+                self.use_mtp = False
+                self.use_builtin_mtp = False
+                self.mtp_drafter = None
+            else:
+                try:
+                    self.mtp_drafter = Qwen35MTPDrafter(
+                        self.model,
+                        device=self.draft_device,
+                        num_draft_tokens=self.mtp_window,
+                        max_seq_len=self.config.max_seq_len,
+                    )
+                    self.config.max_output_len = max(16, self.mtp_window + 1)
+                    xlogger.info(f"Built-in MTP drafter ready (window {self.mtp_window}).")
+                except Exception as ex:
+                    xlogger.warning(f"Failed to initialize built-in MTP drafter ({ex}). Disabling.")
+                    self.mtp_drafter = None
+                    self.use_mtp = False
+                    self.use_builtin_mtp = False
+        elif self.use_mtp:
             xlogger.info(
                 f"Loading {'DFlash' if self.use_dflash else 'MTP'} drafter: "
                 f"{self.draft_model_dir}"
