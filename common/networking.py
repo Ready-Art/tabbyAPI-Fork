@@ -117,8 +117,11 @@ class DisconnectHandler:
         self.cleanup_tasks[key] = (func, args)
 
     async def finish(self, key):
-        # Intentionally strict
-        del self.cleanup_tasks[key]
+        # Tolerate an already-removed key: on a client disconnect poll() -> cleanup()
+        # runs the cleanup tasks and clears the dict, then the job's eos path still
+        # calls finish(id(job)) -> del on a missing key raised KeyError (debug:
+        # KeyError: <id(job)>). pop with a default makes the disconnect race safe.
+        self.cleanup_tasks.pop(key, None)
 
     # Safe to call redundantly, each cleanup task must be called exactly once
     async def cleanup(self):
