@@ -74,6 +74,9 @@ and multiprocess (`mp`) tensor parallelism, MTP speculative decoding on both, TP
 **EXL2.5 quantization format**, and Gemma-4 thinking / tool calls.
 
 > **Scope.** Built and tested on **SM86 (Ampere — RTX 3090)**, end-to-end on **Gemma-4-31B-IT** only.
+> **Qwen3.8-27B**, **Qwen3.8-Flash-Next** and **Gemma-4-26B-A4B-it** are implemented and
+> synthetic-parity verified (incl. built-in MTP on MP for the Qwen3.8 family) but **experimental —
+> real-checkpoint rig validation pending**; see [docs/11](docs/11.-ReadyArt-ExLlamaV2-Fork.md).
 > The primary, optimized path is **MP + CUDA graphs + MTP** on **4× RTX 3090, PCIe P2P
 > (`NCCL_P2P_LEVEL=PXB`), 200 W power cap per card** — reported numbers are a 200 W-cap lower
 > bound; full-powered GPUs are significantly faster. `sp`, `native`, non-MTP and other model
