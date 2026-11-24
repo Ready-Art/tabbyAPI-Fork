@@ -690,6 +690,7 @@ class ExLlamaV2ForkGeneratorAsync:
             and self.mp
             and mtp_drafter is not None
             and not getattr(mtp_drafter, "is_dflash", False)
+            and not getattr(mtp_drafter, "is_builtin", False)
             and os.environ.get("EXL2_PROMPT_OFFLOAD", "1") != "0"
         )
         self._cold_store = (

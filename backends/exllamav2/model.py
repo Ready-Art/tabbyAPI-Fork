@@ -73,9 +73,24 @@ except ImportError:
     ExLlamaV2Cache_Hybrid = None
 
 try:
+    from exllamav2.cache import ExLlamaV2Cache_Qwen4Exp
+except ImportError:
+    ExLlamaV2Cache_Qwen4Exp = None
+
+try:
     from exllamav2.mtp_qwen35 import Qwen35MTPDrafter
 except ImportError:
     Qwen35MTPDrafter = None
+
+try:
+    from exllamav2.mtp_qwen4exp import Qwen4ExpMTPDrafter
+except ImportError:
+    Qwen4ExpMTPDrafter = None
+
+try:
+    from exllamav2.mtp_builtin_mp import BuiltinMTPMPAdapter
+except ImportError:
+    BuiltinMTPMPAdapter = None
 
 try:
     from exllamav2.mtp_drafter import Gemma4AssistantDrafter
@@ -562,6 +577,12 @@ class ExllamaV2Container(BaseModelContainer):
                     xlogger.info("Fork TP/MTP mode: limiting max_batch_size to 1.")
                 self.max_batch_size = 1
 
+        # Built-in MTP drafters are single-sequence (own draft KV, no per-row
+        # shadow): force max_batch_size 1 BEFORE the process group is created.
+        if self.use_builtin_mtp and self.max_batch_size != 1:
+            xlogger.info("Built-in MTP: limiting max_batch_size to 1.")
+            self.max_batch_size = 1
+
         # Prompt-cache RAM offload (opt-in, EXPERIMENTAL): idle lineages tier to
         # host RAM under a byte cap instead of being discarded when a cache row
         # is reused. MP + MTP only (the shadow/snapshot mechanics ride the MTP
@@ -569,10 +590,12 @@ class ExllamaV2Container(BaseModelContainer):
         self.prompt_cache_offload = unwrap(kwargs.get("prompt_cache_offload"), False)
         self.prompt_cache_ram_limit_mb = unwrap(kwargs.get("prompt_cache_ram_limit_mb"), 8192)
         if self.prompt_cache_offload:
-            if not (self.tp_backend == "mp" and self.use_mtp and not self.use_dflash):
+            if not (self.tp_backend == "mp" and self.use_mtp and not self.use_dflash
+                    and not self.use_builtin_mtp):
                 xlogger.warning(
                     "prompt_cache_offload requires the mp tensor-parallel backend "
-                    "with MTP drafting (DFlash is not supported). Disabling offload."
+                    "with MTP drafting (DFlash / built-in MTP are not supported). "
+                    "Disabling offload."
                 )
                 self.prompt_cache_offload = False
             else:
@@ -1008,6 +1031,9 @@ class ExllamaV2Container(BaseModelContainer):
         # Hybrid linear-attention backbone needs the GDN-state cache. newplan.md P6.
         if self.is_hybrid:
             cache_class = ExLlamaV2Cache_Hybrid
+            # Qwen3.8-Flash-Next adds indexer keys + PLE conv state (P7).
+            if getattr(self.config.arch.lm, "hc_residual", False) and ExLlamaV2Cache_Qwen4Exp is not None:
+                cache_class = ExLlamaV2Cache_Qwen4Exp
             if self.cache_mode != "FP16":
                 xlogger.warning("Hybrid models support FP16 cache only; forcing FP16.")
                 self.cache_mode = "FP16"
@@ -1031,7 +1057,9 @@ class ExllamaV2Container(BaseModelContainer):
                 gpu_split,
                 max_seq_len=self.config.max_seq_len,
                 cache_tokens=self.cache_size,
-                cache_base_name="ExLlamaV2Cache_Hybrid" if self.is_hybrid
+                cache_base_name=("ExLlamaV2Cache_Qwen4Exp"
+                                 if getattr(self.config.arch.lm, "hc_residual", False)
+                                 else "ExLlamaV2Cache_Hybrid") if self.is_hybrid
                 else ("ExLlamaV2Cache_SWA" if self.is_swa else "ExLlamaV2Cache"),
                 max_batch=self.max_batch_size if self.use_mtp else 1,
                 max_input_len=self.config.max_input_len,
@@ -1105,32 +1133,49 @@ class ExllamaV2Container(BaseModelContainer):
         # MTP assistant cross-attends to the target's K/V (single-GPU, SP, MP);
         # DFlash conditions on the target's aux hidden states (MP only).
         if self.use_builtin_mtp:
-            # Built-in MTP (Qwen3.5, experimental): drafter weights live in the target
-            # checkpoint; single-process only for now (MP fan-out of the GDN verify
-            # staging is a follow-up). Greedy decoding only.
-            if self.tp_group is not None or self.use_tp:
+            # Built-in MTP: drafter weights live in the target checkpoint (mtp.*).
+            # Qwen3.5/Qwen3.8-27B (P6) and Qwen3.8-Flash-Next (P7). On the MP path
+            # the drafter runs on the master rank behind BuiltinMTPMPAdapter; the
+            # target's GDN/PLE verify state is staged and restored by the
+            # distributed rewind. Single-process TP is not implemented yet.
+            _hc = getattr(self.config.arch.lm, "hc_residual", False)
+            _cls = Qwen4ExpMTPDrafter if _hc else Qwen35MTPDrafter
+            if self.use_tp and self.tp_group is None:
                 xlogger.warning(
-                    "Built-in MTP (experimental) supports single-GPU / autosplit only; "
-                    "disabling drafting for TP/MP."
+                    "Built-in MTP supports single-GPU / autosplit / MP; "
+                    "disabling drafting for single-process TP."
                 )
                 self.use_mtp = False
                 self.use_builtin_mtp = False
                 self.mtp_drafter = None
-            elif Qwen35MTPDrafter is None:
+            elif _cls is None or (self.tp_group is not None and BuiltinMTPMPAdapter is None):
                 xlogger.warning("Built-in MTP requires the ReadyArt exllamav2 fork. Disabling.")
                 self.use_mtp = False
                 self.use_builtin_mtp = False
                 self.mtp_drafter = None
             else:
                 try:
-                    self.mtp_drafter = Qwen35MTPDrafter(
+                    _drafter = _cls(
                         self.model,
                         device=self.draft_device,
                         num_draft_tokens=self.mtp_window,
                         max_seq_len=self.config.max_seq_len,
                     )
+                    if self.tp_group is not None:
+                        self.mtp_drafter = BuiltinMTPMPAdapter(_drafter, self.tp_group)
+                        self.tp_group.enable_mtp(self.mtp_drafter, num_draft_tokens=self.mtp_window)
+                        # The built-in drafter is single-sequence.
+                        if self.max_batch_size is None or self.max_batch_size > 1:
+                            xlogger.info("Built-in MTP on MP: limiting max_batch_size to 1.")
+                        self.max_batch_size = 1
+                        xlogger.info(
+                            f"Built-in MTP drafter ready on MP (window {self.mtp_window}, "
+                            f"{'Qwen4-Exp' if _hc else 'Qwen3.5'} chain)."
+                        )
+                    else:
+                        self.mtp_drafter = _drafter
+                        xlogger.info(f"Built-in MTP drafter ready (window {self.mtp_window}).")
                     self.config.max_output_len = max(16, self.mtp_window + 1)
-                    xlogger.info(f"Built-in MTP drafter ready (window {self.mtp_window}).")
                 except Exception as ex:
                     xlogger.warning(f"Failed to initialize built-in MTP drafter ({ex}). Disabling.")
                     self.mtp_drafter = None
