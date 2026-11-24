@@ -1711,10 +1711,14 @@ class ExllamaV2Container(BaseModelContainer):
             elif eos_reason == "stop_string":
                 stop_str = result.get("eos_triggering_string")
 
-        # Prompt
-        prompt_tokens = result.get("prompt_tokens")
-        cached_tokens = round(result.get("cached_tokens"), 2)
-        prompt_time = round(result.get("time_prefill"), 2)
+        # Prompt. Cancelled/aborted jobs yield an eos result with NO metrics fields
+        # (fork_generator cancel() / batch shutdown); treat missing values as 0 instead
+        # of round(None) -> TypeError, which crashed finalization and recreated the
+        # generator, killing EVERY concurrent job (debug900.txt: one disconnect took
+        # down all streams).
+        prompt_tokens = result.get("prompt_tokens") or 0
+        cached_tokens = round(result.get("cached_tokens") or 0, 2)
+        prompt_time = round(result.get("time_prefill") or 0, 2)
         prompt_ts = (
             "Indeterminate"
             if prompt_time == 0
@@ -1722,12 +1726,12 @@ class ExllamaV2Container(BaseModelContainer):
         )
 
         # Generated
-        gen_tokens = result.get("new_tokens")
-        gen_time = result.get("time_generate")
+        gen_tokens = result.get("new_tokens") or 0
+        gen_time = result.get("time_generate") or 0
         gen_ts = "Indeterminate" if gen_time == 0 else round(gen_tokens / gen_time, 2)
 
         # Queue + Total
-        queue_time = result.get("time_enqueued")
+        queue_time = result.get("time_enqueued") or 0
         total_time = round(queue_time + prompt_time + gen_time, 2)
 
         finish_chunk = {
@@ -1988,10 +1992,12 @@ class ExllamaV2Container(BaseModelContainer):
         except Exception as ex:
             # Create a new generator since the current state is broken
             # No need to wait for this to finish
+            import traceback as _tb
             xlogger.error(
                 "FATAL ERROR with generation. "
                 "Attempting to recreate the generator. "
-                "If this fails, please restart the server.\n",
+                "If this fails, please restart the server.\n"
+                + _tb.format_exc(),
                 {"exception": str(ex)},
             )
             asyncio.ensure_future(self.create_generator())
