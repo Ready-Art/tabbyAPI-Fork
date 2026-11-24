@@ -1251,6 +1251,13 @@ class ExLlamaV2ForkGeneratorAsync:
         driver = MTPMPDriver(pg, self.mtp_drafter, window=self.mtp_window)
         dflash = getattr(self.mtp_drafter, "is_dflash", False)
 
+        # Clear the GLOBAL MP prefill abort flag before EVERY prefill (all paths).
+        # _signal_abort sets it on a disconnect; the reuse/restore paths clear it but
+        # the fresh/reset path did not, so a prior disconnected job left it set and the
+        # next fresh prefill's workers aborted per-chunk -> forward_state returned None
+        # -> "0 tokens generated in 0 seconds" (user log 20:46). A disconnect of THIS
+        # job re-sets it during prefill, so clearing here is safe.
+        pg.abort_flag.clear()
         time_start = time.perf_counter()
         if dflash:
             # DFlash: the prefill also returns the per-token aux states (the
