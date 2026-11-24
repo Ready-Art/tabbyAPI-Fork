@@ -653,14 +653,6 @@ class ExLlamaV2ForkGeneratorAsync:
             return
         self._closed = True
 
-        # Free the cold store's worker-local KV storage + detached ring snapshots
-        # (best-effort; worker exit releases everything anyway).
-        if self._cold_store is not None:
-            try:
-                self._cold_store.clear()
-            except Exception:
-                pass
-
         # Abort the running job, cancel anything still queued
         job = getattr(self, "_current_job", None)
         if job is not None:
@@ -688,6 +680,21 @@ class ExLlamaV2ForkGeneratorAsync:
             await self._worker
         except asyncio.CancelledError:
             pass
+
+        # Free the cold store's worker-local KV storage + detached ring snapshots.
+        # MUST run AFTER the scheduler task has joined: clear() does drop-cold-bundle
+        # send/recv round-trips on the WORKER pipes, and the batch scheduler thread
+        # uses those same pipes for its rounds. Running clear() first (the old order)
+        # put two threads on one Connection concurrently during generator recreation
+        # -> the length-prefixed pickle stream desynced -> "invalid load key, '\x00'"
+        # crashed both the scheduler and close() (debug10.txt). With the worker joined
+        # this is the only thread touching the pipes. Best-effort: worker exit releases
+        # everything anyway.
+        if self._cold_store is not None:
+            try:
+                self._cold_store.clear()
+            except Exception:
+                pass
 
     def _vram_watch(self, tag):
         """Opt-in (EXL2_VRAM_WATCH=1) VRAM accounting: device-wide usage per GPU,
