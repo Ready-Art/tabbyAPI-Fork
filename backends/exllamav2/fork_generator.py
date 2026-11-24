@@ -566,6 +566,16 @@ class ExLlamaV2ForkGeneratorAsync:
         self.reprocess_max_wait_ms = max(0, int(reprocess_max_wait_ms))
         self.priority_preempt = bool(priority_preempt)
         self._reprocess_hits = {}
+        # EXL2_SCHED_DEBUG=1: confirm whether priority/preempt are actually active.
+        # priority_queue is gated by max_batch>1; preemption also requires priority_queue,
+        # so at max_batch==1 both are inert regardless of the config flags.
+        if os.environ.get("EXL2_SCHED_DEBUG", "0") == "1":
+            xlogger.info(
+                f"[sched] max_batch={self.max_batch} priority_queue={self.priority_queue} "
+                f"priority_preempt={self.priority_preempt} "
+                f"(config priority_queue={bool(priority_queue)} preempt={bool(priority_preempt)}); "
+                f"preempt_active={self.priority_queue and self.priority_preempt}"
+            )
         if self.priority_queue:
             xlogger.info(
                 f"Priority prompt scheduler: shortest-first, batch window "
@@ -1028,6 +1038,13 @@ class ExLlamaV2ForkGeneratorAsync:
         n_prompt = ids_cpu.shape[-1]
         self._vram_watch(f"scalar job n={n_prompt}")
         cached = self._cached_ids if self._cache_valid else None
+        # EXL2_PROMPT_REUSE=0 (opt-in isolation, default ON): force a full reset +
+        # re-prefill every turn, bypassing hot reuse / boundary restore / partial /
+        # cold restore. A/B tool to pin whether multi-turn degeneration lives in the
+        # reuse path (coherent with it OFF => reuse corrupts) vs elsewhere.
+        _reuse_off = os.environ.get("EXL2_PROMPT_REUSE", "1") == "0"
+        if _reuse_off:
+            cached = None
         reuse = False
         restored = False
         restore_pos = 0   # the OLD prompt boundary restored to (DFlash aux_p0);
@@ -1036,7 +1053,7 @@ class ExLlamaV2ForkGeneratorAsync:
         prefill_ids = ids_cpu
         cold_partial = False
         start = 0
-        if self.offload_enabled:
+        if self.offload_enabled and not _reuse_off:
             # Cold-tier lookup: when the hot lineage will neither reuse nor restore,
             # a RAM-resident lineage may match this prompt better. Restore it into
             # row 0 and adopt its metadata so the decision block below runs against
@@ -1143,6 +1160,13 @@ class ExLlamaV2ForkGeneratorAsync:
                             f"MP MTP prompt cache {kind}: restored {cpos} tok from RAM "
                             f"in {dt:.0f} ms, prefilling {n_prompt - start} new"
                         )
+                        if os.environ.get("EXL2_PROMPT_CACHE_DEBUG", "0") == "1":
+                            xlogger.info(
+                                f"[pcache] cold kind={kind} n={n_prompt} start={start} "
+                                f"cpos={cpos} clen={clen} match={match_len} bnd={boundary} "
+                                f"seq={pg.cache.current_seq_len} wb={pg.cache.window_beg} "
+                                f"snap_seq={pg._ring_backup_seq} has_snap={has_snap}"
+                            )
                     except Exception as e:
                         xlogger.warning(
                             f"[prompt-offload] cold restore failed "
@@ -1248,6 +1272,28 @@ class ExLlamaV2ForkGeneratorAsync:
             # Tier the discarded lineage to RAM (opt-in) before the full reset.
             self._offload_scalar_lineage()
             pg.mtp_reset_cache()
+        # EXL2_PROMPT_CACHE_DEBUG=1: dump the resolved prompt-cache decision and the
+        # KV/ring/snapshot bookkeeping so a degeneration turn can be pinned to a branch
+        # and a position. Key tells: branch=partial/reset while bnd>0 and snap_seq!=bnd
+        # means the exact boundary restore was skipped (snapshot consumed/mismatched);
+        # start < wb means the prefill starts below the live SWA ring origin.
+        if os.environ.get("EXL2_PROMPT_CACHE_DEBUG", "0") == "1":
+            _br = ("reuse" if reuse else "restore" if restored else
+                   "cold" if cold_partial else "partial" if partial_scalar else "reset")
+            _clen = cached.shape[-1] if cached is not None else -1
+            xlogger.info(
+                f"[pcache] branch={_br} n={n_prompt} start={start} cpos={self._cached_pos} "
+                f"clen={_clen} seq={pg.cache.current_seq_len} wb={pg.cache.window_beg} "
+                f"bnd={self._prompt_boundary} snap_seq={pg._ring_backup_seq} "
+                f"offload={int(self.offload_enabled)}"
+            )
+            if (not reuse and not restored and self._prompt_boundary > 0
+                    and n_prompt > self._prompt_boundary):
+                xlogger.info(
+                    f"[pcache] boundary restore NOT taken: bnd={self._prompt_boundary} "
+                    f"snap_seq={pg._ring_backup_seq} (match={pg._ring_backup_seq == self._prompt_boundary}) "
+                    f"-> fell back to {_br}"
+                )
         driver = MTPMPDriver(pg, self.mtp_drafter, window=self.mtp_window)
         dflash = getattr(self.mtp_drafter, "is_dflash", False)
 
@@ -1522,6 +1568,12 @@ class ExLlamaV2ForkGeneratorAsync:
             # Shortest-prompt-first admission; aged jobs promote ahead (see _pq_key).
             if self.priority_queue and len(pending) > 1:
                 pending.sort(key=self._pq_key)
+                if os.environ.get("EXL2_SCHED_DEBUG", "0") == "1":
+                    xlogger.info(
+                        "[sched] priority reorder: "
+                        + ", ".join(f"{getattr(j, 'request_id', '?')}:"
+                                    f"{j.input_ids.shape[-1]}tok" for j in pending)
+                    )
             for j in pending:
                 if not hasattr(j, "_fork_eligible"):
                     j._fork_eligible = self._mp_mtp_eligible(j)
@@ -2056,6 +2108,12 @@ class ExLlamaV2ForkGeneratorAsync:
                             if j2.cancelled:
                                 continue
                             prev_pref = self._prefilling_job
+                            if os.environ.get("EXL2_SCHED_DEBUG", "0") == "1":
+                                xlogger.info(
+                                    f"[sched] PREEMPT admit {getattr(j2, 'request_id', '?')}:"
+                                    f"{j2.input_ids.shape[-1]}tok into slot {r2} mid-prefill of "
+                                    f"{getattr(prev_pref, 'request_id', '?')}"
+                                )
                             try:
                                 self._admit_job(j2, slots[r2], r2, driver, slots, None)
                             except Exception as e:

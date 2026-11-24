@@ -992,6 +992,7 @@ class ExllamaV2Container(BaseModelContainer):
                 cache_tokens=self.cache_size,
                 cache_base_name="ExLlamaV2Cache_SWA" if self.is_swa else "ExLlamaV2Cache",
                 max_batch=self.max_batch_size if self.use_mtp else 1,
+                max_input_len=self.config.max_input_len,
             )
             self.tp_group.start()
             self.model = self.tp_group.model
