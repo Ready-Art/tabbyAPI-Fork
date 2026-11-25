@@ -277,9 +277,13 @@ async def apply_chat_template(data: ChatCompletionRequest):
             # force_enable_thinking default. Templates that understand effort
             # levels can read reasoning_effort directly; for templates gated on
             # enable_thinking (e.g. Gemma-4), none/minimal turn thinking off and
-            # low/medium/high turn it on.
-            data.template_vars["reasoning_effort"] = data.reasoning_effort
-            data.template_vars["enable_thinking"] = data.reasoning_effort not in (
+            # low/medium/high turn it on. Families with their own tier names
+            # alias OAI levels (Qwen3.5/3.8: high -> xhigh).
+            effort = getattr(model.container, "reasoning_effort_aliases", {}).get(
+                data.reasoning_effort, data.reasoning_effort
+            )
+            data.template_vars["reasoning_effort"] = effort
+            data.template_vars["enable_thinking"] = effort not in (
                 "none",
                 "minimal",
             )

@@ -7,8 +7,8 @@ import pathlib
 from datetime import datetime
 from importlib.metadata import version as package_version
 from typing import Optional
-from jinja2 import Template, TemplateError
-from jinja2.ext import loopcontrols
+from jinja2 import Template, TemplateError, nodes
+from jinja2.ext import Extension, loopcontrols
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from common.logger import xlogger
 from markupsafe import Markup
@@ -27,6 +27,26 @@ class TemplateLoadError(Exception):
 VALID_TOOL_CALL_FORMATS = {"json", "xml", "auto"}
 
 
+class GenerationExtension(Extension):
+    """Support HF chat-template `{% generation %}...{% endgeneration %}` blocks.
+
+    HF's AssistantTracker uses these to record assistant-token spans for
+    training masks; for inference rendering the block is a pass-through.
+    """
+
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(["name:endgeneration"], drop_needle=True)
+        return nodes.CallBlock(
+            self.call_method("_render", []), [], [], body
+        ).set_lineno(lineno)
+
+    def _render(self, caller):
+        return caller()
+
+
 class PromptTemplate:
     """A template for chat completion prompts."""
 
@@ -37,7 +57,7 @@ class PromptTemplate:
         trim_blocks=True,
         lstrip_blocks=True,
         enable_async=True,
-        extensions=[loopcontrols],
+        extensions=[loopcontrols, GenerationExtension],
     )
 
     @staticmethod

@@ -771,6 +771,20 @@ class ExllamaV2Container(BaseModelContainer):
                 self.tool_format = "gemma4"
                 xlogger.info("Gemma-4 detected: defaulting tool_format to 'gemma4'.")
 
+        # Qwen3.5/3.8 conveniences: native tool calls use the pseudo-XML
+        # tool_call / function= / parameter= syntax (the 'qwen3_5' format),
+        # and the chat template only accepts reasoning_effort xhigh/medium/low
+        # (it raises on anything else), so OAI "high" aliases to "xhigh".
+        self.reasoning_effort_aliases = {}
+        self.is_qwen3_5 = (_hf_cfg.model_type or "").startswith("qwen3_5") or any(
+            "qwen3_5" in arch.lower() for arch in (_hf_cfg.architectures or [])
+        )
+        if self.is_qwen3_5:
+            self.reasoning_effort_aliases = {"high": "xhigh"}
+            if not self.tool_format:
+                self.tool_format = "qwen3_5"
+                xlogger.info("Qwen3.5/3.8 detected: defaulting tool_format to 'qwen3_5'.")
+
         # Return the created instance
         return self
 
