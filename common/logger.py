@@ -129,6 +129,99 @@ def setup_logger():
     )
 
 
+def setup_console_tee(path: str):
+    """Mirror stdout + stderr to a file at the DESCRIPTOR level, keeping the terminal.
+
+    The loguru file sink only sees loguru records. A TP worker that dies writes its
+    traceback with a raw sys.stderr.write in its OWN process ([rankN] worker error),
+    and native CUDA/NCCL/segfault messages never pass through Python logging at all.
+    Spawned workers inherit fds 1/2, so tee'ing the descriptors captures them too.
+    Opt-in via logging.log_file; POSIX only (select on pipes).
+    """
+
+    import sys
+    import threading
+
+    if os.name != "posix":
+        logger.warning(f"log_file console tee is POSIX-only; {path} not enabled")
+        return
+
+    try:
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
+        logf = open(path, "ab", buffering=0)
+
+        import select
+
+        r1, w1 = os.pipe()  # stdout
+        r2, w2 = os.pipe()  # stderr
+        out1, out2 = os.dup(1), os.dup(2)
+        os.dup2(w1, 1)
+        os.dup2(w2, 2)
+        os.close(w1)
+        os.close(w2)
+
+        # Spawned workers are fresh interpreters inheriting the tee'd fds; make
+        # them unbuffered so their tracebacks hit the file immediately.
+        os.environ["PYTHONUNBUFFERED"] = "1"
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(line_buffering=True)
+            except Exception:
+                pass
+        # rich decided isatty at first use; the pipe is not a tty, so keep colors.
+        RICH_CONSOLE._force_terminal = True
+
+        stop = threading.Event()
+
+        def _tee():
+            routes = {r1: out1, r2: out2}
+            term_dead = set()
+            while routes:
+                try:
+                    ready, _, _ = select.select(list(routes), [], [], 0.2)
+                except OSError:
+                    break
+                if not ready:
+                    if stop.is_set():
+                        break
+                    continue
+                for rr in ready:
+                    try:
+                        data = os.read(rr, 65536)
+                    except OSError:
+                        data = b""
+                    if not data:
+                        os.close(rr)
+                        del routes[rr]
+                        continue
+                    try:
+                        logf.write(data)
+                    except Exception:
+                        pass
+                    fd = routes[rr]
+                    if fd not in term_dead:
+                        try:
+                            os.write(fd, data)
+                        except Exception:
+                            term_dead.add(fd)
+
+        tee_thread = threading.Thread(target=_tee, daemon=True, name="console-tee")
+        tee_thread.start()
+
+        # Drain pending output at exit so the last lines before shutdown are not lost.
+        import atexit
+
+        def _drain():
+            stop.set()
+            tee_thread.join(timeout=2.0)
+
+        atexit.register(_drain)
+        logger.info(f"Console output (stdout+stderr, incl. TP workers) mirrored to {path}")
+    except Exception as e:
+        logger.warning(f"log_file console tee failed ({e}); using the loguru logs/ sink only")
+
+
 """
 Extended logging via Seq.
 """

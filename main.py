@@ -125,6 +125,13 @@ def entrypoint(
     # load config
     config.load(dict_args)
 
+    # Optional full console capture (stdout+stderr, including spawned TP workers
+    # and native CUDA/NCCL messages). Installed before model load / worker spawn.
+    if config.logging.log_file:
+        from common.logger import setup_console_tee
+
+        setup_console_tee(config.logging.log_file)
+
     # optionally enable seqlog logging
     if config.developer.seqlog:
         xlogger.setup(

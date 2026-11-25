@@ -108,6 +108,16 @@ class LoggingConfig(BaseConfigModel):
             "and user-provided content are preserved for bug-report reproduction."
         ),
     )
+    log_file: Optional[str] = Field(
+        None,
+        description=(
+            "Mirror ALL console output (stdout + stderr) to this file while keeping the\n"
+            "terminal output. Unlike the logs/ loguru sink, this also captures spawned TP\n"
+            "worker tracebacks ([rankN] worker error), print() output and native CUDA/NCCL\n"
+            "crash messages, because workers inherit the tee'd descriptors. Appends, no\n"
+            "rotation (default: None = off). Example: logs/server.log"
+        ),
+    )
 
 
 class ModelConfig(BaseConfigModel):

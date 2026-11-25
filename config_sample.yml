@@ -49,6 +49,12 @@ logging:
   # and user-provided content are preserved for bug-report reproduction.
   log_chat_completion_requests: false
 
+  # Mirror ALL console output (stdout + stderr) to this file, keeping terminal output.
+  # Unlike the logs/ loguru files, this ALSO captures TP worker crash tracebacks
+  # ([rankN] worker error), print() output and native CUDA/NCCL messages.
+  # Appends, no rotation. Uncomment to enable (default: off).
+  # log_file: logs/server.log
+
 # Options for model overrides and loading
 # Please read the comments to understand how arguments are handled
 # between initial and API loads
