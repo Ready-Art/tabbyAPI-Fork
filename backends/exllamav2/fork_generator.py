@@ -399,6 +399,38 @@ def _worker_vram_stats(ctx):
     )
 
 
+def _cache_slot_kv_bytes(cache):
+    """Preallocated KV bytes ONE cache row (slot) holds on this rank.
+
+    The KV for every slot is reserved at load (cache_size spans all max_batch
+    rows), so admitting a job into a free row allocates no new KV. Sum the fp16
+    K/V rings + full layers and the INT8-primary K/V + fp16 scales, then divide
+    by the batch (row) count. Used by the admission gate to credit free slots'
+    already-resident KV back to the free-VRAM figure."""
+    batch = max(1, getattr(cache, "batch_size", 1))
+    total = 0
+    ks = getattr(cache, "key_states", [])
+    vs = getattr(cache, "value_states", [])
+    for l in range(len(ks)):
+        kc = ks[l]
+        vc = vs[l] if l < len(vs) else None
+        if kc is not None:
+            total += kc.numel() * kc.element_size()
+        if vc is not None:
+            total += vc.numel() * vc.element_size()
+    for (ki, vi, ksc, vsc) in getattr(cache, "kv_i8", {}).values():
+        total += ki.numel() * ki.element_size()
+        total += vi.numel() * vi.element_size()
+        total += ksc.numel() * ksc.element_size()
+        total += vsc.numel() * vsc.element_size()
+    return total // batch
+
+
+def _worker_slot_kv_bytes(ctx):
+    """Per-rank per-slot KV bytes for the admission gate (via the 'exec' command)."""
+    return _cache_slot_kv_bytes(ctx["cache"])
+
+
 class _ColdPromptStore:
     """Host-RAM tier of the MP+MTP prompt cache (opt-in, EXPERIMENTAL).
 
@@ -1949,17 +1981,51 @@ class ExLlamaV2ForkGeneratorAsync:
         except Exception:
             return float("inf")   # never block admission if the query fails
 
+    def _slot_kv_bytes_per_rank(self):
+        """Per-slot preallocated KV bytes for every rank (master + workers), cached.
+        The geometry is fixed at load, so query the workers once."""
+        cached = getattr(self, "_slot_kv_cache", None)
+        if cached is not None:
+            return cached
+        pg = self.tp_group
+        nd = torch.cuda.device_count()
+        out = [0] * nd
+        out[pg.master_device] = _cache_slot_kv_bytes(pg.cache)
+        for dev, w in sorted(pg.workers.items()):
+            w.send("exec", (_worker_slot_kv_bytes, ()))
+        for dev, w in sorted(pg.workers.items()):
+            out[dev] = w.recv()
+        self._slot_kv_cache = out
+        return out
+
+    def _effective_free_vram_mib(self, free_count):
+        """Free VRAM credited with the preallocated KV of the FREE slots. Each free
+        slot's KV is already resident (reserved at load), so admitting into it spends
+        no new KV VRAM -- counting it back lets concurrent slots admit instead of the
+        gate serializing them on the tightest card. Min across ranks, like the raw
+        free-VRAM figure."""
+        try:
+            nd = torch.cuda.device_count()
+            slot_kv = self._slot_kv_bytes_per_rank()
+            return min(torch.cuda.mem_get_info(d)[0] / 2**20
+                       + free_count * slot_kv[d] / 2**20 for d in range(nd))
+        except Exception:
+            return float("inf")   # never block admission if the query fails
+
     def _vram_admit_ok(self, slots):
-        """Gate a new admission on VRAM headroom for the prefill scratch. When the
-        tightest card is below the headroom, flush idle slot lineages to the RAM cold
-        tier first (releasing their ring-snapshot / draft-shadow VRAM; the cold store
-        evicts its coldest entries if RAM is full). If still short, hold the job only
-        while a running slot can finish and free scratch -- never stall an idle device.
-        Tunable via EXL2_ADMIT_VRAM_HEADROOM_MB (0 disables the gate)."""
+        """Gate a new admission on VRAM headroom for the prefill scratch. The KV for
+        every slot is preallocated at load, so a FREE slot's KV is credited back to
+        the free-VRAM figure (_effective_free_vram_mib) -- admitting into a free row
+        spends no new KV, and concurrent slots must not serialize on the tightest
+        card. When still below the headroom, flush idle slot lineages to the RAM cold
+        tier (releasing their ring-snapshot / draft-shadow VRAM); if still short, hold
+        the job only while a running slot can finish and free scratch -- never stall
+        an idle device. Tunable via EXL2_ADMIT_VRAM_HEADROOM_MB (0 disables the gate)."""
         headroom = int(os.environ.get("EXL2_ADMIT_VRAM_HEADROOM_MB", "1500"))
         if headroom <= 0:
             return True
-        if self._min_free_vram_mib() >= headroom:
+        free_count = sum(1 for s in slots if not s.active and s.job is None)
+        if self._effective_free_vram_mib(free_count) >= headroom:
             return True
         flushed = False
         for i, s in enumerate(slots):
@@ -1971,7 +2037,7 @@ class ExLlamaV2ForkGeneratorAsync:
             xlogger.info(
                 f"[admit] VRAM tight (free {self._min_free_vram_mib():.0f} MiB < "
                 f"{headroom} MiB headroom); flushed idle lineages to RAM")
-        if self._min_free_vram_mib() >= headroom:
+        if self._effective_free_vram_mib(free_count) >= headroom:
             return True
         # Still short: wait for a running job to free scratch, but don't deadlock if
         # nothing is running (idle-but-full device) -- admit and let it proceed.
