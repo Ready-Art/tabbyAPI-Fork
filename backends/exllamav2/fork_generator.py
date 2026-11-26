@@ -840,8 +840,14 @@ class ExLlamaV2ForkGeneratorAsync:
             if d is not None:
                 sp = getattr(d, "sparse", None)
                 spn = None if sp is None or sp.subset is None else sp.subset.shape[0]
-                lines.append(f"[vram-watch]   draft graph={d._draft_graph is not None} "
-                             f"b_graphs={list(getattr(d, '_b_graphs', {}).keys())} "
+                # Multi-batch drafting uses the per-B batch graphs (_b_graphs); the
+                # scalar _draft_graph is only set on the B=1 eager-fallback path, so
+                # report a draft graph active if EITHER is captured.
+                _bg = getattr(d, '_b_graphs', {})
+                _dg = d._draft_graph is not None or any(
+                    ent.get("graph") is not None for ent in _bg.values())
+                lines.append(f"[vram-watch]   draft graph={_dg} "
+                             f"b_graphs={list(_bg.keys())} "
                              f"sparse_cols={spn}")
             if self._cold_store is not None:
                 lines.append(f"[vram-watch]   cold store="
@@ -1748,6 +1754,11 @@ class ExLlamaV2ForkGeneratorAsync:
                         if not s.active and s.job is None]
                 if not free:
                     break
+                # VRAM headroom gate: flush idle lineages to RAM if tight, and hold the
+                # job (leave it pending) rather than admit into an OOM. It retries after
+                # running slots finish and free their prefill scratch.
+                if not self._vram_admit_ok(slots):
+                    break
                 r = self._choose_slot(slots, free, j)
                 pending.remove(j)
                 if j.cancelled:
@@ -1916,6 +1927,43 @@ class ExLlamaV2ForkGeneratorAsync:
                 f"[prompt-offload] offload slot {r} failed "
                 f"({type(e).__name__}: {e}); lineage discarded"
             )
+
+    def _min_free_vram_mib(self):
+        """Smallest device-wide free VRAM (MiB) across all ranks. The master can query
+        every device via mem_get_info; the tightest card gates admission."""
+        try:
+            nd = torch.cuda.device_count()
+            return min((torch.cuda.mem_get_info(d)[0] / 2**20) for d in range(nd))
+        except Exception:
+            return float("inf")   # never block admission if the query fails
+
+    def _vram_admit_ok(self, slots):
+        """Gate a new admission on VRAM headroom for the prefill scratch. When the
+        tightest card is below the headroom, flush idle slot lineages to the RAM cold
+        tier first (releasing their ring-snapshot / draft-shadow VRAM; the cold store
+        evicts its coldest entries if RAM is full). If still short, hold the job only
+        while a running slot can finish and free scratch -- never stall an idle device.
+        Tunable via EXL2_ADMIT_VRAM_HEADROOM_MB (0 disables the gate)."""
+        headroom = int(os.environ.get("EXL2_ADMIT_VRAM_HEADROOM_MB", "1500"))
+        if headroom <= 0:
+            return True
+        if self._min_free_vram_mib() >= headroom:
+            return True
+        flushed = False
+        for i, s in enumerate(slots):
+            if not s.active and s.job is None and s.cache_valid:
+                self._offload_slot(s, i)
+                s.cache_valid = False
+                flushed = True
+        if flushed:
+            xlogger.info(
+                f"[admit] VRAM tight (free {self._min_free_vram_mib():.0f} MiB < "
+                f"{headroom} MiB headroom); flushed idle lineages to RAM")
+        if self._min_free_vram_mib() >= headroom:
+            return True
+        # Still short: wait for a running job to free scratch, but don't deadlock if
+        # nothing is running (idle-but-full device) -- admit and let it proceed.
+        return not any(s.active for s in slots)
 
     def _admit_job(self, job, slot, r, driver, slots, pending=None):
         """Prompt-cache decision + chunked prefill into row r, then arm the MTP row.
