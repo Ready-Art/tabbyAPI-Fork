@@ -1224,13 +1224,14 @@ class ExLlamaV2ForkGeneratorAsync:
                     own_ok = True   # boundary restore may hit
             if not own_ok:
                 min_len = int(os.environ.get("EXL2_BATCH_CLONE_MIN", "512"))
+                sw = getattr(self.tp_group.model.config, "sliding_window", 0) or 0
                 cold = self._cold_store.match(ids_cpu, min_len)
                 p_own = 0
                 if cached is not None:
                     m1 = min(cached.shape[-1], n_prompt)
                     match1 = _prefix_match_len(ids_cpu, cached, m1)
                     p1 = min(match1, self._cached_pos)
-                    if match1 >= min_len and p1 > 0 and p1 >= pg.cache.window_beg:
+                    if match1 >= min_len and p1 > 0 and p1 - sw >= pg.cache.window_beg:
                         p_own = p1
                 if cold is not None and cold[2] > p_own:
                     rec, match_len, p = cold
@@ -1270,7 +1271,10 @@ class ExLlamaV2ForkGeneratorAsync:
                                 and pg.restore_prompt_ring(boundary)):
                             wb_now = pg.cache.window_beg
                             target = min(match_len, boundary)
-                            if target >= wb_now:
+                            # Ring covers [wb_now, boundary]; generation at target needs
+                            # [target - sw, target] -> require full window coverage, else
+                            # the lower SWA window is stale ("several replies back").
+                            if target - sw >= wb_now:
                                 if target < boundary:
                                     pg.truncate_cache(target)
                                 start = target
@@ -1281,7 +1285,7 @@ class ExLlamaV2ForkGeneratorAsync:
                                 pg.mtp_reset_cache()
                                 start = 0
                                 kind = "cold restore (reset)"
-                        elif match_len >= wb:
+                        elif match_len - sw >= wb:
                             pg.truncate_cache(match_len)
                             start = match_len
                             kind = "cold restore (partial prefix)"
@@ -1296,7 +1300,7 @@ class ExLlamaV2ForkGeneratorAsync:
                             # past the prompt -> commit_base "beyond tracked tokens"
                             # (crash.txt CRASH 1). Below the ring origin: full reset.
                             start -= 1
-                            if start >= pg.cache.window_beg:
+                            if start - sw >= pg.cache.window_beg:
                                 pg.truncate_cache(start)
                             else:
                                 pg.mtp_reset_cache()
@@ -1399,11 +1403,15 @@ class ExLlamaV2ForkGeneratorAsync:
             # cached history but shares a long prefix inside the live ring. Rewind to
             # the divergence point and prefill only the suffix.
             min_len = int(os.environ.get("EXL2_BATCH_CLONE_MIN", "512"))
+            sw = getattr(self.tp_group.model.config, "sliding_window", 0) or 0
             m = min(cached.shape[-1], n_prompt)
             match = _prefix_match_len(ids_cpu, cached, m)
             p = min(match, self._cached_pos)
             start_p = p if n_prompt > p else p - 1
-            if match >= min_len and p > 0 and start_p >= pg.cache.window_beg:
+            # Require the live ring to cover the SWA window at start_p
+            # ([start_p - sw, start_p]); truncating further back reads stale K/V
+            # ("several replies back") -> fall through to a full reset + re-prefill.
+            if match >= min_len and p > 0 and start_p - sw >= pg.cache.window_beg:
                 self._offload_scalar_lineage()
                 # Rewind to the ACTUAL prefill start: prefill appends at
                 # current_seq_len, so the exact-match last-token rewrite (start=p-1)
@@ -1865,6 +1873,7 @@ class ExLlamaV2ForkGeneratorAsync:
         if os.environ.get("EXL2_BATCH_KV_CLONE", "1") == "0":
             return None
         min_len = int(os.environ.get("EXL2_BATCH_CLONE_MIN", "512"))
+        sw = getattr(self.tp_group.model.config, "sliding_window", 0) or 0
         n = ids_cpu.shape[-1]
         cache = self.tp_group.cache
         best = None
@@ -1883,7 +1892,7 @@ class ExLlamaV2ForkGeneratorAsync:
                 continue
             wb = cache.window_begs[i]
             m = min(src_ids.shape[-1], n, pos)
-            if m < min_len or m <= wb:
+            if m < min_len or m - sw <= wb:
                 continue
             a, b = ids_cpu[0, :m], src_ids[0, :m]
             if torch.equal(a, b):
@@ -1891,7 +1900,10 @@ class ExLlamaV2ForkGeneratorAsync:
             else:
                 diff = (a != b).nonzero()
                 match = int(diff[0]) if diff.numel() else m
-            if match < min_len or match <= wb:
+            # The cloned ring must cover the SWA window at the clone position
+            # ([match - sw, match]); a source whose ring shifted past that cannot
+            # serve a valid state (lower window K/V gone -> stale attention).
+            if match < min_len or match - sw <= wb:
                 continue
             if best is None or match > best[1]:
                 best = (i, match)
@@ -2031,6 +2043,7 @@ class ExLlamaV2ForkGeneratorAsync:
         if not reuse and not restored:
             min_len = int(os.environ.get("EXL2_BATCH_CLONE_MIN", "512"))
             clone_on = os.environ.get("EXL2_BATCH_KV_CLONE", "1") != "0"
+            sw = getattr(self.tp_group.model.config, "sliding_window", 0) or 0
             # Candidate 1 -- own-lineage partial prefix: the prompt diverges from this
             # slot's history (edited/regenerated turn, different question on the same
             # document) but shares a long prefix with it. Rewind the slot to the
@@ -2042,7 +2055,12 @@ class ExLlamaV2ForkGeneratorAsync:
                 m = min(clen, n_prompt)
                 match = _prefix_match_len(ids_cpu, slot.cached_ids, m)
                 p = min(match, slot.cached_pos)
-                if (match >= min_len and 0 < p >= pg.cache.window_begs[r]
+                # The live ring covers [window_begs[r], cached_pos]; generating at p
+                # attends [p - sw, p], so require p - sw >= window_begs[r] (full window
+                # coverage). Truncating further back leaves the lower SWA window stale
+                # -> the model reads old K/V ("several replies back"). Fall back to
+                # clone/cold/reset instead.
+                if (match >= min_len and 0 < p and p - sw >= pg.cache.window_begs[r]
                         and (n_prompt > p or p - 1 >= pg.cache.window_begs[r])):
                     p_own = p
             # Candidate 2 -- shared-prefix clone from another HOT slot: concurrent
@@ -2074,14 +2092,20 @@ class ExLlamaV2ForkGeneratorAsync:
                 # while prefilling from p-1 left the row one token past the prompt
                 # (crash.txt CRASH 1 off-by-one).
                 start = p_own if n_prompt > p_own else p_own - 1
-                pg.truncate_row(r, start)
-                prefill_ids = ids_cpu[:, start:]
-                partial = True
-                slot.hits += 1
-                xlogger.info(
-                    f"MP MTP prompt cache partial reuse (slot {r}): rewound to shared "
-                    f"prefix {p_own}, prefilling {n_prompt - start} new"
-                )
+                if start - sw >= pg.cache.window_begs[r]:
+                    pg.truncate_row(r, start)
+                    prefill_ids = ids_cpu[:, start:]
+                    partial = True
+                    slot.hits += 1
+                    xlogger.info(
+                        f"MP MTP prompt cache partial reuse (slot {r}): rewound to shared "
+                        f"prefix {p_own}, prefilling {n_prompt - start} new"
+                    )
+                else:
+                    # Ring can't cover the SWA window at start -> full re-prefill.
+                    pg.mtp_reset_row(r)
+                    start = 0
+                    prefill_ids = ids_cpu
             elif best_p > 0 and best_p == p_clone:
                 self._offload_slot(slot, r)
                 i, p = src
@@ -2128,6 +2152,7 @@ class ExLlamaV2ForkGeneratorAsync:
                     slot.cache_valid = True
                     self._cold_store.consume(rec["id"])
                     wb = pg.cache.window_begs[r]
+                    sw = getattr(self.tp_group.model.config, "sliding_window", 0) or 0
                     if (match_len >= clen and n_prompt >= clen
                             and torch.equal(ids_cpu[:, :clen], rec["ids"][:, :clen])
                             and -(self.mtp_window + 1) <= overshoot <= 8
@@ -2147,7 +2172,15 @@ class ExLlamaV2ForkGeneratorAsync:
                         # the boundary (long chats) -- the snapshot restores that K/V.
                         wb_now = pg.cache.window_begs[r]
                         target = min(match_len, boundary)
-                        if target >= wb_now:
+                        # The restored ring covers [wb_now, boundary]. Generating at
+                        # `target` attends the SWA window [target - sw, target], so the
+                        # ring must cover that whole span -- not just target >= wb_now.
+                        # A thought-stripped re-render diverging well before the boundary
+                        # (target << boundary) leaves [target - sw, wb_now) MISSING from
+                        # the ring -> wrong SWA attention -> degenerate / no-thinking
+                        # replies. Require full window coverage; otherwise reset +
+                        # re-prefill (the missing SWA K/V cannot be reconstructed).
+                        if target - sw >= wb_now:
                             if target < boundary:
                                 pg.truncate_row(r, target)
                             start = target
@@ -2157,9 +2190,11 @@ class ExLlamaV2ForkGeneratorAsync:
                             pg.mtp_reset_row(r)
                             start = 0
                             kind = "cold restore (reset)"
-                    elif match_len >= wb:
+                    elif match_len - sw >= wb:
                         # No snapshot rewind: truncate to the shared prefix inside the
-                        # final live ring.
+                        # final live ring. Require the ring to cover the SWA window at
+                        # match_len ([match_len - sw, match_len]); otherwise the lower
+                        # window portion is stale/missing -> reset + re-prefill.
                         pg.truncate_row(r, match_len)
                         start = match_len
                         kind = "cold restore (partial prefix)"
@@ -2175,7 +2210,7 @@ class ExLlamaV2ForkGeneratorAsync:
                         # (prefill appends at seq_lens[r]); below the ring origin
                         # falls back to a full reset. crash.txt CRASH 1 off-by-one.
                         start -= 1
-                        if start >= pg.cache.window_begs[r]:
+                        if start - sw >= pg.cache.window_begs[r]:
                             pg.truncate_row(r, start)
                         else:
                             pg.mtp_reset_row(r)
