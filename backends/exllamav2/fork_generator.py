@@ -1870,22 +1870,29 @@ class ExLlamaV2ForkGeneratorAsync:
         prefix with the job's prompt (chat continuations land on their own slot). Any
         free slot is correct -- _admit_job reuses or resets based on the exact check.
 
+        Rank by the SHARED prefix length (_prefix_match_len), not an exact full-prefix
+        match: a thought-stripped / re-rendered continuation diverges at the assistant
+        reply, so an exact-match test sees no match and scatters it onto the coldest
+        free slot -- away from its own lineage -- forcing a full re-prefill. The shared
+        prefix still identifies its slot, where _admit_job's boundary-restore / partial
+        rewind reuses the document.
+
         With RAM offload enabled, a COLD lineage may match better than any free slot's
         hot lineage; then (or when nothing hot matches) pick the COLDEST free slot so
         the least-valued idle lineage is the one evicted to RAM."""
         best, best_len = free[0], -1
-        ids = job.input_ids
+        ids_cpu = job.input_ids.cpu()
+        min_len = int(os.environ.get("EXL2_BATCH_CLONE_MIN", "512"))
         for i in free:
             s = slots[i]
             if not s.cache_valid or s.cached_ids is None:
                 continue
-            m = min(s.cached_ids.shape[-1], ids.shape[-1])
-            if m > 0 and torch.equal(s.cached_ids[:, :m], ids[:, :m]):
-                if m > best_len:
-                    best, best_len = i, m
+            m = min(s.cached_ids.shape[-1], ids_cpu.shape[-1])
+            match = _prefix_match_len(ids_cpu, s.cached_ids, m)
+            if match >= min_len and match > best_len:
+                best, best_len = i, match
         if self.offload_enabled:
-            min_len = int(os.environ.get("EXL2_BATCH_CLONE_MIN", "512"))
-            cold = self._cold_store.match(ids.cpu(), min_len)
+            cold = self._cold_store.match(ids_cpu, min_len)
             cold_len = cold[1] if cold is not None else -1
             if cold_len > best_len or best_len < 0:
                 return min(free, key=lambda i: (slots[i].last_used, slots[i].hits))
