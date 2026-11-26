@@ -740,6 +740,7 @@ class ExllamaV2Container(BaseModelContainer):
         self.reasoning_end_token = kwargs.get("reasoning_end_token", "</think>")
         self.reasoning_suppress_header = kwargs.get("reasoning_suppress_header", None)
         self.force_enable_thinking = kwargs.get("force_enable_thinking", False)
+        self.force_thought_block = kwargs.get("force_thought_block", False)
 
         # Gemma-4 conveniences: its reasoning channel is <|channel>thought\n ...
         # <channel|> (enabled via <|think|> in the system turn, which the model's

@@ -365,6 +365,17 @@ class ModelConfig(BaseConfigModel):
             "not explicitly enable this and some models need it to properly enter reasoning mode."
         ),
     )
+    force_thought_block: bool = Field(
+        False,
+        description=(
+            "Prefill the reasoning opener so the model must think (default: False).\n"
+            "Appends the reasoning start token (+ suppress_header, e.g. Gemma-4's\n"
+            "'<|channel>thought\\n') to the prompt when reasoning is enabled and the template\n"
+            "did not already open the channel. Many finetunes do not spontaneously emit the\n"
+            "thought opener; prefilling it forces them into the reasoning channel. Requires\n"
+            'reasoning: true. Skipped when thinking is disabled or the opener is already present.'
+        ),
+    )
     reasoning: bool = Field(
         False,
         description=(

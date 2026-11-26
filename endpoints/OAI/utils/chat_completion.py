@@ -309,6 +309,26 @@ async def apply_chat_template(data: ChatCompletionRequest):
         if bos_token and model.container.hf_model.add_bos_token() and prompt.startswith(bos_token):
             prompt = prompt.removeprefix(bos_token)
 
+        # Force-inject the reasoning opener so finetunes that do not spontaneously
+        # open the thought channel are prefilled into it (e.g. Gemma-4's
+        # '<|channel>thought\n'). The template leaves a normal thinking turn at
+        # '<|turn>model\n' expecting the model to emit the opener itself; many
+        # finetunes never do. Prefilling it forces the reasoning channel, and
+        # _start_in_reasoning_mode() below detects the trailing opener so the parser
+        # streams the continuation as reasoning_content. Skipped when thinking is
+        # disabled or the channel is already open (e.g. after a tool response).
+        mc = model.container
+        if (
+            mc.force_thought_block
+            and mc.reasoning
+            and mc.reasoning_start_token
+            and data.template_vars.get("enable_thinking", True)
+            and not _start_in_reasoning_mode(prompt)
+        ):
+            opener = mc.reasoning_start_token + (mc.reasoning_suppress_header or "")
+            if not prompt.endswith(opener):
+                prompt += opener
+
         return prompt, mm_embeddings
 
     except KeyError as exc:
