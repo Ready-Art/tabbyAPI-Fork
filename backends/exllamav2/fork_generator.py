@@ -2338,6 +2338,14 @@ class ExLlamaV2ForkGeneratorAsync:
         pg.abort_flag.clear()
         self._prefilling_job = job
         chunk_size = max(256, pg.config.max_input_len)
+        # Decode responsiveness during prefill: a full chunk (e.g. 4096 tok ~ 5 s)
+        # between decode rounds starves active generating slots to ~0.5 t/s. When
+        # other slots are active, cap the prefill STEP so a decode round runs every
+        # ~interleave tokens instead of every full chunk -- generation stays live
+        # while prefill still progresses (smaller step = more decode priority, slower
+        # prefill). EXL2_PREFILL_DECODE_INTERLEAVE tokens (default 512; 0 = old
+        # full-chunk behavior). The step never exceeds chunk_size (SWA ring cap).
+        interleave = int(os.environ.get("EXL2_PREFILL_DECODE_INTERLEAVE", "512"))
         n = prefill_ids.shape[-1]
         pos = 0
         logits = state = None
@@ -2358,7 +2366,12 @@ class ExLlamaV2ForkGeneratorAsync:
                 if job.abort_event.is_set():
                     aborted = True
                     break
-                end = min(pos + chunk_size, n)
+                # Finer prefill steps while other slots generate, so the decode round
+                # below runs often enough to keep their Gen T/S live (see interleave).
+                step = chunk_size
+                if interleave > 0 and any(s.active for s in slots):
+                    step = max(256, min(chunk_size, interleave))
+                end = min(pos + step, n)
                 if end == n:
                     logits, state = pg.forward_state_row(
                         r, prefill_ids[:, pos:end], last_id_only=True)
@@ -2371,7 +2384,7 @@ class ExLlamaV2ForkGeneratorAsync:
                 if job.abort_event.is_set():
                     aborted = True
                     break
-                # Keep active jobs decoding during long prefills: stall <= one chunk.
+                # Keep active jobs decoding during long prefills: stall <= one step.
                 if any(s.active for s in slots):
                     self._batch_decode_round_safe(slots, driver)
                 # Priority preemption (opt-in priority_preempt): admit newly arrived
