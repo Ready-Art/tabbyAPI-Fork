@@ -12,9 +12,14 @@ with a scripted MemAvailable; the real D2H/H2D paths are on-GPU integration.
 """
 
 import os
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+# Allow direct invocation (python tests/test_offload_ram_budget.py) from any cwd:
+# put the tabbyAPI-Fork root on sys.path so `backends` / `common` resolve.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
