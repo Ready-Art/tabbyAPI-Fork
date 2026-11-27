@@ -90,6 +90,16 @@ class TestEstimateOffloadBytes(unittest.TestCase):
 
 
 class TestMakeRoom(unittest.TestCase):
+    def setUp(self):
+        # The budget paths log evictions/skips through loguru's default console
+        # sink in tests (setup_logger is not called). Silence them so expected
+        # WARNING lines (e.g. the deliberate low-RAM skip test) are not mistaken
+        # for test failures.
+        for level in ("info", "warning"):
+            p = patch.object(fg.xlogger, level, Mock())
+            p.start()
+            self.addCleanup(p.stop)
+
     def _store(self, cap_mb, sizes):
         pg = Mock()
         pg.drop_offload_bundle = Mock()
