@@ -201,6 +201,10 @@ class ExllamaV2Container(BaseModelContainer):
         self.model_dir = model_directory
         self.config.model_dir = str(model_directory.resolve())
         self.hf_model = hf_model
+        # Original load kwargs: if a TP worker process dies, the dead group can
+        # only be rebuilt through a full model reload (_recover_dead_tp_group).
+        self._load_kwargs = dict(kwargs)
+        self._tp_recovering = False
 
         # Make the max seq len 4096 before preparing the config
         # This is a better default than 2048
@@ -1279,6 +1283,17 @@ class ExllamaV2Container(BaseModelContainer):
     async def create_generator(self):
         """Create and save a Exllama generator class."""
 
+        # A dead TP worker process cannot be revived by a new scheduler: the
+        # group's workers / NCCL state are gone, and reusing the group FATALs
+        # every later request (BrokenPipe cascade, 2026-11-26 server.log).
+        # Recover through a full model reload instead. Skip while the load lock
+        # is held (load_gen calls us mid-load; a load failure surfaces there).
+        if (self.fork_mode and self.tp_group is not None
+                and not self.load_lock.locked()
+                and not self.tp_group.workers_alive()):
+            asyncio.ensure_future(self._recover_dead_tp_group())
+            return
+
         try:
             # Don't acquire locks unless a model is loaded
             if self.loaded:
@@ -1364,6 +1379,37 @@ class ExllamaV2Container(BaseModelContainer):
 
                 async with self.load_condition:
                     self.load_condition.notify_all()
+
+    async def _recover_dead_tp_group(self):
+        """A TP worker process died (host OOM-kill, native crash). The dead group
+        cannot be reused by a recreated scheduler -- reload the model through the
+        same path as a model swap (unload + load_model_gen rebuilds the container,
+        respawns the workers and reloads the shards). Guarded so concurrent FATALs
+        trigger a single reload. In-flight requests are aborted; new requests wait
+        on the load lock / get a clean 'model is being unloaded' error meanwhile."""
+        if self._tp_recovering:
+            return
+        self._tp_recovering = True
+        try:
+            xlogger.error(
+                "TP worker process died -- reloading the model to recover "
+                "(in-flight requests are aborted)."
+            )
+            from common.model import unload_model, load_model_gen
+            model_dir = self.model_dir
+            kwargs = dict(self._load_kwargs or {})
+            await unload_model(skip_wait=True)
+            async for _ in load_model_gen(model_dir, **kwargs):
+                pass
+            xlogger.info("Model reloaded after TP worker death.")
+        except Exception:
+            import traceback as _tb
+            xlogger.error(
+                "Automatic reload after TP worker death FAILED -- "
+                "please restart the server.\n" + _tb.format_exc()
+            )
+        finally:
+            self._tp_recovering = False
 
     def get_loras(self):
         """Convenience function to get all loras."""

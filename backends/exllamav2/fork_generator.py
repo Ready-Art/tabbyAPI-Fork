@@ -431,6 +431,49 @@ def _worker_slot_kv_bytes(ctx):
     return _cache_slot_kv_bytes(ctx["cache"])
 
 
+def _mem_available_bytes():
+    """MemAvailable from /proc/meminfo (Linux); None where unavailable."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return None
+
+
+def _estimate_offload_bytes(pg, row, pos, wb):
+    """Host bytes an offload of (row, pos, wb) will hold across ALL ranks: the
+    KV pack (same walk as _pack_row_offload) plus the detached prompt-boundary
+    ring snapshot, estimated from the master's cache geometry (per-rank shard
+    shapes are identical; layers may split unevenly but kv-head shards do not).
+    Used to evict cold entries BEFORE the offload allocates."""
+    cache = pg.cache
+    world = len(pg.workers) + 1
+    ring = cache.kv_state_size
+    n = max(0, min(pos - wb, ring))
+    kv = 0
+    snap = 0
+    i8 = getattr(cache, "kv_i8", {})
+    for l in range(len(cache.key_states)):
+        if l in i8:
+            ki = i8[l][0]
+            kh, hd = ki.shape[2], ki.shape[3]
+            kv += 2 * pos * kh * hd + 4 * pos * kh
+            continue
+        kc = cache.key_states[l]
+        if kc is None:
+            continue
+        kh, hd = kc.shape[2], kc.shape[3]
+        if kc.shape[1] == ring:
+            kv += 4 * n * kh * hd
+            snap += 4 * ring * kh * hd
+        else:
+            kv += 4 * pos * kh * hd
+    return (kv + snap) * world
+
+
 class _ColdPromptStore:
     """Host-RAM tier of the MP+MTP prompt cache (opt-in, EXPERIMENTAL).
 
@@ -511,6 +554,38 @@ class _ColdPromptStore:
         self.total += size
         self.n_offload += 1
         return rec
+
+    def make_room(self, est_bytes):
+        """Evict coldest entries BEFORE an offload allocates, so the store fits
+        both the configured cap and PHYSICAL host RAM. The offload transiently
+        holds ~2x the bundle (pinned staging + the stored copy) on top of live
+        ring snapshots / prefill scratch, so require MemAvailable headroom beyond
+        the bundle itself. Returns False when the offload must be skipped
+        (nothing left to evict and still short) -- the caller degrades to a full
+        re-prefill. Without this, a near-full store + one post-prefill ring
+        snapshot OOM-killed a TP worker (2026-11-26 server.log 18:06:42)."""
+        if est_bytes > self.cap:
+            xlogger.info(
+                f"[prompt-offload] skip: lineage ~{est_bytes / 2**20:.0f} MB "
+                f"exceeds the RAM cap ({self.cap / 2**20:.0f} MB)"
+            )
+            return False   # entry alone exceeds the whole cap
+        while self.total + est_bytes > self.cap and self.entries:
+            self._evict_coldest("RAM cap (pre-offload)")
+        margin = int(os.environ.get("EXL2_OFFLOAD_RAM_MARGIN_MB", "8192")) * 2**20
+        need = 2 * est_bytes + margin
+        avail = _mem_available_bytes()
+        while avail is not None and avail < need and self.entries:
+            self._evict_coldest("host RAM headroom")
+            avail = _mem_available_bytes()
+        if avail is not None and avail < need:
+            xlogger.warning(
+                f"[prompt-offload] skip: host RAM headroom {avail / 2**20:.0f} MB "
+                f"< {need / 2**20:.0f} MB needed (store {self.total / 2**20:.0f} MB, "
+                f"{len(self.entries)} entries); lineage will re-prefill"
+            )
+            return False
+        return True
 
     def _evict_coldest(self, reason):
         eid = min(self.entries,
@@ -1181,6 +1256,9 @@ class ExLlamaV2ForkGeneratorAsync:
         if pos < min_len or pos != self._cached_pos:
             return
         try:
+            if not self._cold_store.make_room(
+                    _estimate_offload_bytes(pg, 0, pos, pg.cache.window_beg)):
+                return
             bundle = pg.offload_row(0, pos=pos, wb=pg.cache.window_beg)
             if bundle is None:
                 return
@@ -1960,6 +2038,9 @@ class ExLlamaV2ForkGeneratorAsync:
         if pos < min_len or pos != slot.cached_pos:
             return
         try:
+            if not self._cold_store.make_room(
+                    _estimate_offload_bytes(pg, r, pos, pg.cache.window_begs[r])):
+                return
             bundle = pg.offload_row(r, pos=pos, wb=pg.cache.window_begs[r])
             if bundle is None:
                 return
